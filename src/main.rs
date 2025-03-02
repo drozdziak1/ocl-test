@@ -1,6 +1,6 @@
 mod nseq_tokenizer;
 
-use ocl::{Buffer, ProQue};
+use ocl::{Buffer, Platform, ProQue};
 
 use nseq_tokenizer::ByteTokenizer;
 
@@ -8,13 +8,12 @@ pub static COUNT_UNIQUE_NSEQS_KERNEL: &'static str = include_str!("./kernel.cl")
 
 pub type ErrBox = Box<dyn std::error::Error>;
 
-pub const NSEQ_SIZE: usize = 10;
+pub const NSEQ_SIZE: usize = 2;
 
 fn main() -> Result<(), ErrBox> {
     let s = "rabarbar jest kurwa tak bardzo najsmaczniejszym czymś że o ja pierdolę";
 
-    let s = format!("{s}{s}{s}{s}{s}");
-    let s = format!("{s}{s}{s}");
+    println!("host: work size is {}", s.len());
 
     let s_preprocessed: Vec<u32> = s.chars().map(|c| c as u32).collect();
 
@@ -32,8 +31,11 @@ fn main() -> Result<(), ErrBox> {
         .buffer_builder()
         .len(NSEQ_SIZE * s_preprocessed.len())
         .build()?;
-    let nseq_slot_locks: Buffer<u32> =
-        pro_que.buffer_builder().len(s_preprocessed.len()).build()?;
+    let nseq_slot_locks: Buffer<i32> = pro_que
+        .buffer_builder()
+        .len(s_preprocessed.len())
+        .fill_val(-1)
+        .build()?;
 
     let kernel = pro_que
         .kernel_builder("count_unique_nseqs")
@@ -44,13 +46,17 @@ fn main() -> Result<(), ErrBox> {
         .arg(&nseq_slot_locks)
         .build()?;
 
+    println!("before enq");
     unsafe {
         kernel.enq()?;
     }
+    println!("after enq");
 
     let mut counts: Vec<u32> = vec![0u32; s_preprocessed.len()];
 
+    println!("before nseq_counts read");
     nseq_counts_buf.read(&mut counts).enq()?;
+    println!("after nseq_counts read");
 
     println!("counts: {:?}", counts);
 
