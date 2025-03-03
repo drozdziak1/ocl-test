@@ -61,12 +61,6 @@ impl<const N: usize> Debug for Token<N> {
     }
 }
 
-/// Holds n-sequence to token lookups and tracks token id assignment
-pub struct ByteTokenizer<const N: usize = 2> {
-    tokens: HashMap<[TokenComponent<N>; N], Token<N>>,
-    next_free_id: usize,
-}
-
 /// Finds the most frequent n-sequence of token components.
 pub fn most_common_nsequence<const N: usize>(
     tok_comps: &[TokenComponent<N>],
@@ -89,10 +83,18 @@ pub fn most_common_nsequence<const N: usize>(
     max_nseq
 }
 
-impl<const N: usize> ByteTokenizer<N> {
-    pub fn new() -> Self {
-        ByteTokenizer {
+/// Holds n-sequence to token lookups and tracks token id assignment
+pub struct NSeqTokenizer<const N: usize = 2> {
+    tokens: HashMap<[TokenComponent<N>; N], Token<N>>,
+    vocab_size: usize,
+    next_free_id: usize,
+}
+
+impl<const N: usize> NSeqTokenizer<N> {
+    pub fn new(vocab_size: usize) -> Self {
+        NSeqTokenizer {
             tokens: Default::default(),
+            vocab_size,
             next_free_id: 0,
         }
     }
@@ -149,12 +151,18 @@ impl<const N: usize> ByteTokenizer<N> {
 
     /// Constructs new tokens from most common n-sequences in the
     /// string, returning the number of new tokens created.
-    pub fn ingest(&mut self, s: &str) -> usize {
+    pub fn ingest(&mut self, s: &str) -> (usize, bool) {
         let mut s_tok_comps = self.tokenize_str(s);
 
         let mut n_new_tokens = 0;
+        let mut vocab_full = false;
 
         while let Some(nseq) = most_common_nsequence(&s_tok_comps) {
+            if self.tokens.len() >= self.vocab_size {
+                vocab_full = true;
+                break;
+            }
+
             self.tokens.insert(
                 nseq.clone(),
                 Token {
@@ -169,7 +177,7 @@ impl<const N: usize> ByteTokenizer<N> {
             s_tok_comps = self.tokenize(s_tok_comps);
         }
 
-        n_new_tokens
+        (n_new_tokens, vocab_full)
     }
 }
 
@@ -197,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_untokenize_equiv() {
-        let mut tokenizer = ByteTokenizer::<2>::new();
+        let mut tokenizer = NSeqTokenizer::<2>::new(50);
         let input = "Litwo, ojczyzno moja, Ty jesteś jak zdrowie. Ile Cię trzeba cenić, ten tylko się dowie, kto Cię stracił.";
 
         tokenizer.ingest(&input);
@@ -207,5 +215,22 @@ mod tests {
         let untokenized = tokenizer.untokenize(&tokenized);
 
         assert_eq!(input, untokenized);
+    }
+
+    #[test]
+    fn test_tokenizer_respects_vocab_size() {
+        let mut tokenizer = NSeqTokenizer::<2>::new(2);
+        let input = "blablabla";
+
+        assert_eq!(tokenizer.ingest(&input), (2, true));
+
+        let bl_comps: Vec<_> = "bl".chars().map(|c| TokenComponent::Char(c)).collect();
+        let bla_comps = [
+            TokenComponent::Tok(Box::new(tokenizer.tokens[bl_comps.as_slice()].clone())),
+            TokenComponent::Char('a'),
+        ];
+
+        assert!(tokenizer.tokens.contains_key(bl_comps.as_slice()));
+        assert!(tokenizer.tokens.contains_key(bla_comps.as_slice()));
     }
 }
