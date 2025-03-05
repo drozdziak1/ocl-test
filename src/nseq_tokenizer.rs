@@ -85,8 +85,8 @@ pub fn most_common_nsequence<const N: usize>(
 
 /// Holds n-sequence to token lookups and tracks token id assignment
 pub struct NSeqTokenizer<const N: usize = 2> {
-    tokens: HashMap<[TokenComponent<N>; N], Token<N>>,
-    vocab_size: usize,
+    pub tokens: HashMap<[TokenComponent<N>; N], Token<N>>,
+    pub vocab_size: usize,
     next_free_id: usize,
 }
 
