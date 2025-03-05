@@ -7,7 +7,7 @@ use crate::ErrBox;
 
 pub const MAX_WORK_SIZE: usize = 32;
 
-pub static MOST_COMMON_NSEQ_KERNEL: &'static str = include_str!("./kernel.cl");
+pub static MOST_COMMON_NSEQ_KERNEL: &'static str = include_str!("./kernels/most_common_nseq.cl");
 
 lazy_static! {
     static ref PROQUE: Arc<Mutex<ProQue>> = {
