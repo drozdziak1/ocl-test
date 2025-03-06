@@ -2,6 +2,9 @@
 
 use std::{collections::HashMap, fmt::Debug};
 
+/// Used for differentiating UTF32 codepoints from token ids
+pub const TOK_ID_OFFSET: u32 = 2_000_000;
+
 /// Tokens consist of N components. Each of them is either another
 /// token with its own components, or a literal character
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -27,6 +30,13 @@ impl<const N: usize> TokenComponent<N> {
             Self::Tok(t) => t.unroll(),
         }
     }
+
+    pub fn as_u32(&self) -> u32 {
+	match self {
+	    Self::Char(c) => *c as u32,
+	    Self::Tok(t) => TOK_ID_OFFSET + t.id as u32,
+	}
+    }
 }
 
 /// Token representation parametrized by how many TokenComponent's are
@@ -45,6 +55,16 @@ impl<const N: usize> Token<N> {
         }
 
         ret_accum
+    }
+
+    pub fn as_u32s(&self) -> Vec<u32> {
+	let mut ret = Vec::with_capacity(N);
+
+	for comp in self.components.iter() {
+	    ret.push(comp.as_u32())
+	}
+
+	ret
     }
 }
 
