@@ -1,9 +1,23 @@
 //! Crude, generalized byte-pair encoding implementation
 
-use std::{collections::HashMap, fmt::Debug};
+use lazy_static::lazy_static;
+use regex::Regex;
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::{Arc, RwLock},
+};
+
+use crate::{ErrBox, NSEQ_SIZE};
 
 /// Used for differentiating UTF32 codepoints from token ids
 pub const TOK_ID_OFFSET: u32 = 2_000_000;
+
+lazy_static! {
+    static ref REGEX_ALLOWED: Regex =
+        Regex::new(r"^( ?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+|\s+)$").expect("Failed to compile REGEX_ALLOWED");
+}
 
 /// Tokens consist of N components. Each of them is either another
 /// token with its own components, or a literal character
@@ -32,10 +46,10 @@ impl<const N: usize> TokenComponent<N> {
     }
 
     pub fn as_u32(&self) -> u32 {
-	match self {
-	    Self::Char(c) => *c as u32,
-	    Self::Tok(t) => TOK_ID_OFFSET + t.id as u32,
-	}
+        match self {
+            Self::Char(c) => *c as u32,
+            Self::Tok(t) => TOK_ID_OFFSET + t.id as u32,
+        }
     }
 }
 
@@ -58,13 +72,13 @@ impl<const N: usize> Token<N> {
     }
 
     pub fn as_u32s(&self) -> Vec<u32> {
-	let mut ret = Vec::with_capacity(N);
+        let mut ret = Vec::with_capacity(N);
 
-	for comp in self.components.iter() {
-	    ret.push(comp.as_u32())
-	}
+        for comp in self.components.iter() {
+            ret.push(comp.as_u32())
+        }
 
-	ret
+        ret
     }
 }
 
@@ -85,19 +99,31 @@ impl<const N: usize> Debug for Token<N> {
 pub fn most_common_nsequence<const N: usize>(
     tok_comps: &[TokenComponent<N>],
 ) -> Option<[TokenComponent<N>; N]> {
-    let mut acc = HashMap::new();
+    let mut nseq_acc = HashMap::new();
+
+    // We turn the whole n-sequence back to a string to check against
+    // REGEX_ALLOWED. Once we learn those that don't fit, they are
+    // cached here.
+    let mut bad_nseqs = HashSet::new();
 
     let mut max_nseq = None;
     let mut max_nseq_appearances = 1;
 
     for nseq in tok_comps.windows(N) {
-        let entry = acc.entry(nseq).or_insert(0);
-        *entry += 1;
+        if !bad_nseqs.contains(nseq){
+	    let unrolled: String = nseq.iter().map(|comp| comp.unroll()).collect();
+            if REGEX_ALLOWED.is_match(&unrolled) {
+		let entry = nseq_acc.entry(nseq).or_insert(0);
+		*entry += 1;
 
-        if *entry > max_nseq_appearances {
-            max_nseq = Some(nseq.to_owned().try_into().expect("kurwoooooo"));
-            max_nseq_appearances = *entry;
-        }
+		if *entry > max_nseq_appearances {
+                    max_nseq = Some(nseq.to_owned().try_into().expect("kurwoooooo"));
+                    max_nseq_appearances = *entry;
+		}
+            } else {
+		bad_nseqs.insert(nseq.to_vec());
+	    }
+	}
     }
 
     max_nseq
@@ -105,9 +131,9 @@ pub fn most_common_nsequence<const N: usize>(
 
 /// Holds n-sequence to token lookups and tracks token id assignment
 pub struct NSeqTokenizer<const N: usize = 2> {
-    pub tokens: HashMap<[TokenComponent<N>; N], Token<N>>,
+    pub tokens: Arc<RwLock<HashMap<[TokenComponent<N>; N], Token<N>>>>,
     pub vocab_size: usize,
-    next_free_id: usize,
+    next_free_id: Arc<RwLock<usize>>,
 }
 
 impl<const N: usize> NSeqTokenizer<N> {
@@ -115,8 +141,12 @@ impl<const N: usize> NSeqTokenizer<N> {
         NSeqTokenizer {
             tokens: Default::default(),
             vocab_size,
-            next_free_id: 0,
+            next_free_id: Arc::new(RwLock::new(0)),
         }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.tokens.read().expect("tokens len read").len() >= self.vocab_size
     }
 
     pub fn tokenize_str(&self, s: &str) -> Vec<TokenComponent<N>> {
@@ -129,6 +159,7 @@ impl<const N: usize> NSeqTokenizer<N> {
     pub fn tokenize(&self, tok_comps: Vec<TokenComponent<N>>) -> Vec<TokenComponent<N>> {
         let mut pass_input: Vec<_> = tok_comps;
 
+        let tokens = self.tokens.read().expect("tokens read");
         loop {
             let mut n_replacements = 0;
             let mut i: usize = 0;
@@ -136,7 +167,7 @@ impl<const N: usize> NSeqTokenizer<N> {
             let mut pass_result: Vec<TokenComponent<N>> = Vec::new();
 
             while let Some(nseq) = pass_input.get(i..i + N) {
-                if let Some(tok) = self.tokens.get(nseq) {
+                if let Some(tok) = tokens.get(nseq) {
                     pass_result.push(TokenComponent::Tok(Box::new(tok.clone())));
                     n_replacements += 1;
                     i += N;
@@ -171,28 +202,34 @@ impl<const N: usize> NSeqTokenizer<N> {
 
     /// Constructs new tokens from most common n-sequences in the
     /// string, returning the number of new tokens created.
-    pub fn ingest(&mut self, s: &str) -> (usize, bool) {
+    pub fn ingest(&self, s: &str) -> (usize, bool) {
         let mut s_tok_comps = self.tokenize_str(s);
 
         let mut n_new_tokens = 0;
         let mut vocab_full = false;
 
         while let Some(nseq) = most_common_nsequence(&s_tok_comps) {
-            if self.tokens.len() >= self.vocab_size {
+            if self.is_full() {
                 vocab_full = true;
                 break;
             }
 
-            self.tokens.insert(
-                nseq.clone(),
-                Token {
-                    components: nseq,
-                    id: self.next_free_id,
-                },
-            );
+            {
+                let mut next_free_id = self.next_free_id.write().expect("next_free_id write");
+                let mut tokens = self.tokens.write().expect("tokens write");
+                if !tokens.contains_key(&nseq) {
+                    tokens.insert(
+                        nseq.clone(),
+                        Token {
+                            components: nseq,
+                            id: *next_free_id,
+                        },
+                    );
 
-            self.next_free_id += 1;
-            n_new_tokens += 1;
+                    *next_free_id += 1;
+                    n_new_tokens += 1;
+                }
+            }
 
             s_tok_comps = self.tokenize(s_tok_comps);
         }
@@ -239,18 +276,20 @@ mod tests {
 
     #[test]
     fn test_tokenizer_respects_vocab_size() {
-        let mut tokenizer = NSeqTokenizer::<2>::new(2);
+        let tokenizer = NSeqTokenizer::<2>::new(2);
         let input = "blablabla";
 
         assert_eq!(tokenizer.ingest(&input), (2, true));
 
+        let tokens_read = tokenizer.tokens.read().expect("tokens read");
+
         let bl_comps: Vec<_> = "bl".chars().map(|c| TokenComponent::Char(c)).collect();
         let bla_comps = [
-            TokenComponent::Tok(Box::new(tokenizer.tokens[bl_comps.as_slice()].clone())),
+            TokenComponent::Tok(Box::new(tokens_read[bl_comps.as_slice()].clone())),
             TokenComponent::Char('a'),
         ];
 
-        assert!(tokenizer.tokens.contains_key(bl_comps.as_slice()));
-        assert!(tokenizer.tokens.contains_key(bla_comps.as_slice()));
+        assert!(tokens_read.contains_key(bl_comps.as_slice()));
+        assert!(tokens_read.contains_key(bla_comps.as_slice()));
     }
 }

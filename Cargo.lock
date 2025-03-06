@@ -954,6 +954,8 @@ dependencies = [
  "lazy_static",
  "ocl",
  "polars",
+ "rayon",
+ "regex",
 ]
 
 [[package]]
