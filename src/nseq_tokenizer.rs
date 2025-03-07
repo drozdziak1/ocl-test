@@ -15,8 +15,8 @@ use crate::{ErrBox, NSEQ_SIZE};
 pub const TOK_ID_OFFSET: u32 = 2_000_000;
 
 lazy_static! {
-    static ref REGEX_ALLOWED: Regex =
-        Regex::new(r"^( ?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+|\s+)$").expect("Failed to compile REGEX_ALLOWED");
+    static ref REGEX_ALLOWED: Regex = Regex::new(r"^( ?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+|\s+)$")
+        .expect("Failed to compile REGEX_ALLOWED");
 }
 
 /// Tokens consist of N components. Each of them is either another
@@ -55,7 +55,7 @@ impl<const N: usize> TokenComponent<N> {
 
 /// Token representation parametrized by how many TokenComponent's are
 /// merged during tokenization.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Hash)]
 pub struct Token<const N: usize> {
     id: usize,
     components: [TokenComponent<N>; N],
@@ -81,6 +81,14 @@ impl<const N: usize> Token<N> {
         ret
     }
 }
+
+impl<const N: usize> PartialEq for Token<N> {
+    fn eq(&self, other: &Self) -> bool {
+	self.id == other.id
+    }
+}
+
+impl<const N: usize> Eq for Token<N> {}
 
 impl<const N: usize> Debug for Token<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -110,20 +118,20 @@ pub fn most_common_nsequence<const N: usize>(
     let mut max_nseq_appearances = 1;
 
     for nseq in tok_comps.windows(N) {
-        if !bad_nseqs.contains(nseq){
-	    let unrolled: String = nseq.iter().map(|comp| comp.unroll()).collect();
+        if !bad_nseqs.contains(nseq) {
+            let unrolled: String = nseq.iter().map(|comp| comp.unroll()).collect();
             if REGEX_ALLOWED.is_match(&unrolled) {
-		let entry = nseq_acc.entry(nseq).or_insert(0);
-		*entry += 1;
+                let entry = nseq_acc.entry(nseq).or_insert(0);
+                *entry += 1;
 
-		if *entry > max_nseq_appearances {
+                if *entry > max_nseq_appearances {
                     max_nseq = Some(nseq.to_owned().try_into().expect("kurwoooooo"));
                     max_nseq_appearances = *entry;
-		}
+                }
             } else {
-		bad_nseqs.insert(nseq.to_vec());
-	    }
-	}
+                bad_nseqs.insert(nseq.to_vec());
+            }
+        }
     }
 
     max_nseq

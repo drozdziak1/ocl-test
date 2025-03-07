@@ -62,29 +62,33 @@ fn main() -> Result<(), ErrBox> {
 
                 let (n_new_toks, full) = t.ingest(txt);
 
-                let pct_full = (old_vocab_len + n_new_toks) as f64 / vocab_size as f64 * 100.0;
-                println!(
-                    "Row\t{}/{}:\t{:.5}% full, {:.5} toks/char ingested {} new tokens from {} chars",
-                    my_idx,
-                    n_rows,
-                    pct_full,
-                    n_new_toks as f64 / txt.len() as f64,
-                    n_new_toks,
-		    txt.len()
-                );
-
                 if full {
                     let mut duration = duration.lock().expect("duration lock");
                     if duration.is_none() {
                         *duration = Some(start_time.elapsed());
+                        println!("Tokenizer is full after {} iterations", my_idx);
                     }
-                    println!("Tokenizer is full after {} iterations", my_idx);
+                } else {
+                    let pct_full = (old_vocab_len + n_new_toks) as f64 / vocab_size as f64 * 100.0;
+                    println!(
+			"Elapsed: {:5}s Row\t{}/{}:\t{:.5}% full, {:.5} toks/char ingested {} new tokens from {} chars",
+			start_time.elapsed().as_secs(),
+			my_idx,
+			n_rows,
+			pct_full,
+			n_new_toks as f64 / txt.len() as f64,
+			n_new_toks,
+			txt.len()
+		    );
                 }
             }
         },
     );
 
-    let duration = duration.lock().expect("duration lock").expect("duration still None after processind");
+    let duration = duration
+        .lock()
+        .expect("duration lock")
+        .expect("duration still None after processind");
 
     println!("Processing took {}s", duration.as_secs());
 
