@@ -9,8 +9,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{ErrBox, NSEQ_SIZE};
-
 /// Used for differentiating UTF32 codepoints from token ids
 pub const TOK_ID_OFFSET: u32 = 2_000_000;
 
@@ -84,7 +82,7 @@ impl<const N: usize> Token<N> {
 
 impl<const N: usize> PartialEq for Token<N> {
     fn eq(&self, other: &Self) -> bool {
-	self.id == other.id
+        self.id == other.id
     }
 }
 
@@ -104,42 +102,49 @@ impl<const N: usize> Debug for Token<N> {
 }
 
 /// Finds the most frequent n-sequence of token components.
-pub fn most_common_nsequence<const N: usize>(
+pub fn most_common_nsequences<const N: usize>(
     tok_comps: &[TokenComponent<N>],
-) -> Option<[TokenComponent<N>; N]> {
-    let mut nseq_acc = HashMap::new();
+) -> Vec<([TokenComponent<N>; N], usize)> {
+    let mut nseq_acc: HashMap<[TokenComponent<N>; N], usize> = HashMap::new();
 
     // We turn the whole n-sequence back to a string to check against
     // REGEX_ALLOWED. Once we learn those that don't fit, they are
     // cached here.
     let mut bad_nseqs = HashSet::new();
 
-    let mut max_nseq = None;
-    let mut max_nseq_appearances = 1;
-
     for nseq in tok_comps.windows(N) {
         if !bad_nseqs.contains(nseq) {
             let unrolled: String = nseq.iter().map(|comp| comp.unroll()).collect();
             if REGEX_ALLOWED.is_match(&unrolled) {
-                let entry = nseq_acc.entry(nseq).or_insert(0);
+                let entry = nseq_acc
+                    .entry(
+                        nseq.to_owned()
+                            .try_into()
+                            .expect("Somehow the window is not N-sized"),
+                    )
+                    .or_insert(0);
                 *entry += 1;
-
-                if *entry > max_nseq_appearances {
-                    max_nseq = Some(nseq.to_owned().try_into().expect("kurwoooooo"));
-                    max_nseq_appearances = *entry;
-                }
             } else {
                 bad_nseqs.insert(nseq.to_vec());
             }
         }
     }
 
-    max_nseq
+    let mut nseqs_vec: Vec<([TokenComponent<N>; N], usize)> =
+        nseq_acc.into_iter().filter(|(_nseq, n)| *n > 1).collect();
+
+    nseqs_vec.sort_by_key(|(_nseq, n)| *n);
+
+    nseqs_vec
 }
 
 /// Holds n-sequence to token lookups and tracks token id assignment
+#[derive(Debug)]
 pub struct NSeqTokenizer<const N: usize = 2> {
     pub tokens: Arc<RwLock<HashMap<[TokenComponent<N>; N], Token<N>>>>,
+    /// Helps elliminate distinct groups of token components that
+    /// unroll to the same string during training
+    pub tokens_unrolled: Arc<RwLock<HashSet<String>>>,
     pub vocab_size: usize,
     next_free_id: Arc<RwLock<usize>>,
 }
@@ -148,6 +153,7 @@ impl<const N: usize> NSeqTokenizer<N> {
     pub fn new(vocab_size: usize) -> Self {
         NSeqTokenizer {
             tokens: Default::default(),
+            tokens_unrolled: Default::default(),
             vocab_size,
             next_free_id: Arc::new(RwLock::new(0)),
         }
@@ -213,36 +219,62 @@ impl<const N: usize> NSeqTokenizer<N> {
     pub fn ingest(&self, s: &str) -> (usize, bool) {
         let mut s_tok_comps = self.tokenize_str(s);
 
-        let mut n_new_tokens = 0;
+        let mut total_new_tokens = 0;
         let mut vocab_full = false;
 
-        while let Some(nseq) = most_common_nsequence(&s_tok_comps) {
+        loop {
+            let nseqs = most_common_nsequences(&s_tok_comps);
+
+            if nseqs.is_empty() {
+                break;
+            }
+
             if self.is_full() {
                 vocab_full = true;
                 break;
             }
 
+            // How many times we added a token in this round
+            let mut new_tokens_this_pass = 0;
+
             {
                 let mut next_free_id = self.next_free_id.write().expect("next_free_id write");
                 let mut tokens = self.tokens.write().expect("tokens write");
-                if !tokens.contains_key(&nseq) {
-                    tokens.insert(
-                        nseq.clone(),
-                        Token {
-                            components: nseq,
-                            id: *next_free_id,
-                        },
-                    );
+                let mut tokens_unrolled =
+                    self.tokens_unrolled.write().expect("tokens_unrolled write");
 
-                    *next_free_id += 1;
-                    n_new_tokens += 1;
+                for (nseq, _n) in nseqs.iter().rev() {
+                    if !tokens.contains_key(nseq) {
+                        let unrolled: String = self.untokenize(nseq.as_slice());
+
+                        if !tokens_unrolled.contains(&unrolled) {
+                            tokens.insert(
+                                nseq.clone(),
+                                Token {
+                                    components: nseq.clone(),
+                                    id: *next_free_id,
+                                },
+                            );
+
+                            tokens_unrolled.insert(unrolled);
+
+                            *next_free_id += 1;
+                            new_tokens_this_pass += 1;
+                        }
+                    }
                 }
             }
 
+            if new_tokens_this_pass == 0 {
+                // No work was done, we've added everything
+                break;
+            }
+
+            total_new_tokens += new_tokens_this_pass;
             s_tok_comps = self.tokenize(s_tok_comps);
         }
 
-        (n_new_tokens, vocab_full)
+        (total_new_tokens, vocab_full)
     }
 }
 
@@ -257,7 +289,7 @@ mod tests {
             .map(|c| TokenComponent::Char(c))
             .collect();
 
-        let most_common = most_common_nsequence(&input);
+        let most_common = most_common_nsequences(&input);
 
         let expected: [TokenComponent<3>; 3] = [
             TokenComponent::Char('b'),
