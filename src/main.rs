@@ -71,7 +71,7 @@ fn main() -> Result<(), ErrBox> {
                 } else {
                     let pct_full = (old_vocab_len + n_new_toks) as f64 / vocab_size as f64 * 100.0;
                     println!(
-			"Elapsed: {:5}s Row\t{}/{}:\t{:.5}% full, {:.5} toks/char ingested {} new tokens from {} chars",
+			"Elapsed: {:5}s Row{:10}/{}: {:4.5}% full, {:.5} toks/char ingested {:5} new tokens from {:8} chars",
 			start_time.elapsed().as_secs(),
 			my_idx,
 			n_rows,
