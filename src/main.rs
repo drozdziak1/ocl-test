@@ -1,6 +1,7 @@
 mod nseq_tokenizer;
 
 use clap::Parser;
+use dialoguer::Confirm;
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{info, LevelFilter};
 use polars::prelude::*;
@@ -8,6 +9,8 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use std::{
     env,
+    fs::File,
+    io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
@@ -33,13 +36,31 @@ pub struct Cli {
     output: PathBuf,
     #[arg(short = 's', long, default_value_t = 100_000)]
     /// At how many unique tokens should we stop training the tokenizer
-    vocab_size: usize,
+    vocab_size: u32,
 }
 
 fn main() -> Result<(), ErrBox> {
     init_log();
 
     let cli = Cli::parse();
+
+    match File::open(&cli.output) {
+        Ok(_f) => {
+            let overwrite_ok = Confirm::new()
+                .with_prompt(format!(
+                    "{} appears to exist. Do you want to overwrite?",
+                    cli.output.display()
+                ))
+                .interact()?;
+            if !overwrite_ok {
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(other) => {
+            return Err(other.into());
+        }
+    }
 
     let df = LazyFrame::scan_parquet(cli.fineweb_path, Default::default())?
         .select([col("text")])
@@ -136,13 +157,16 @@ fn main() -> Result<(), ErrBox> {
     let duration = duration
         .lock()
         .expect("duration lock")
-        .expect("duration still None after processind");
+        .expect("duration still None after processing");
 
     println!("Processing took {}s", duration.as_secs());
 
-    let kupsko_tokenized = t.tokenize_str("I like big butts and I cannot lie");
+    let export = t.export();
 
-    dbg!(kupsko_tokenized);
+    let f = File::create(&cli.output)?;
+
+    println!("Exporting tokenizer to {}...", cli.output.display());
+    serde_json::to_writer_pretty(&f, &export)?;
 
     Ok(())
 }
