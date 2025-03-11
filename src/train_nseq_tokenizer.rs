@@ -18,6 +18,8 @@ use std::{
 
 use nseq_tokenizer::NSeqTokenizer;
 
+use util::ErrBox;
+
 pub type ErrBox = Box<dyn std::error::Error>;
 
 pub const NSEQ_SIZE: usize = 2;

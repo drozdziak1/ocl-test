@@ -10,9 +10,18 @@ env_logger = "0.11.6"
 indicatif = {version = "0.17.11", features = ["rayon"]}
 lazy_static = "1.5.0"
 log = "0.4.26"
+ndarray = "0.16.1"
 ocl = "0.19.7"
 polars = {version = "0.46.0", features = ["lazy", "parquet"]}
 rayon = "1.10.0"
 regex = "1.11.1"
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.140"
+
+[[bin]]
+name = "train-nseq-tokenizer"
+path = "src/train_nseq_tokenizer.rs"
+
+[[bin]]
+name = "train-llm"
+path = "src/train_llm.rs"
