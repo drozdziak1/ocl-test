@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     sync::{Arc, RwLock},
 };
@@ -22,7 +22,7 @@ lazy_static! {
 
 /// Tokens consist of N components. Each of them is either another
 /// token with its own components, or a literal character
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum TokenComponent<const N: usize> {
     Tok(Box<Token<N>>),
     Char(char),
@@ -56,7 +56,7 @@ impl<const N: usize> TokenComponent<N> {
 
 /// Token representation parametrized by how many TokenComponent's are
 /// merged during tokenization.
-#[derive(Clone, Hash)]
+#[derive(Clone, Hash, PartialOrd, Ord)]
 pub struct Token<const N: usize> {
     id: u32,
     components: [TokenComponent<N>; N],
@@ -114,7 +114,7 @@ impl<const N: usize> Debug for Token<N> {
 pub fn most_common_nsequences<const N: usize>(
     tok_comps: &[TokenComponent<N>],
 ) -> Vec<([TokenComponent<N>; N], usize)> {
-    let mut nseq_acc: HashMap<[TokenComponent<N>; N], usize> = HashMap::new();
+    let mut nseq_acc: BTreeMap<[TokenComponent<N>; N], usize> = BTreeMap::new();
 
     // We turn the whole n-sequence back to a string to check against
     // REGEX_ALLOWED. Once we learn those that don't fit, they are
@@ -458,12 +458,9 @@ mod tests {
         dbg!(&tokens_read);
 
         let bl_comps: Vec<_> = "bl".chars().map(|c| TokenComponent::Char(c)).collect();
-        let bla_comps = [
-            TokenComponent::Tok(Box::new(tokens_read[bl_comps.as_slice()].clone())),
-            TokenComponent::Char('a'),
-        ];
+        let la_comps: Vec<_> = "la".chars().map(|c| TokenComponent::Char(c)).collect();
 
         assert!(tokens_read.contains_key(bl_comps.as_slice()));
-        assert!(tokens_read.contains_key(bla_comps.as_slice()));
+        assert!(tokens_read.contains_key(la_comps.as_slice()));
     }
 }
