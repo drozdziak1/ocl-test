@@ -1,28 +1,31 @@
 use crate::util::ErrBox;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3, AxisDescription, Zip};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub struct Transformer {
     embed: Array2<f32>,
     blocks: Vec<TransformerBlock>,
 }
 
-/// Computes the value of a min/max tensor randomization value,
-/// e.g. if X = dims2rand_boundary(), you use it for range (-X, X) for
-/// the randomization sampling range.
-fn dims2rand_boundary(x: usize, y: usize) -> f32 {
-    (x as f32 * y as f32).sqrt()
+/// Computes the range for tensor randomization
+fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
+    let prod_sqrt = dims
+        .iter()
+        .fold(1.0, |acc, elem| acc * (*elem) as f32)
+        .sqrt();
+    Uniform::new(-prod_sqrt, prod_sqrt)
 }
 
 impl Transformer {
     pub fn new(
         ctx_width: usize,
+        vocab_size: usize,
         embed_dim: usize,
         num_layers: usize,
         num_heads: usize,
         ff_dim: usize,
-        dropout: f32,
     ) -> Result<Self, ErrBox> {
         if embed_dim % num_heads != 0 {
             return Err(format!(
@@ -32,48 +35,184 @@ impl Transformer {
             .into());
         }
 
-        let rand_boundary = dims2rand_boundary(ctx_width, embed_dim);
+        let rand_dist = dims2rand_dist(vec![vocab_size, embed_dim].as_slice());
 
-        let embed = Array2::random(
-            (ctx_width, embed_dim),
-            Uniform::new(-rand_boundary, rand_boundary),
-        );
+        let embed = Array2::random((vocab_size, embed_dim), rand_dist);
 
         let blocks = (0..num_layers)
-            .map(|_i| TransformerBlock::new(embed_dim, num_heads, ff_dim, dropout))
+            .map(|_i| TransformerBlock::new(embed_dim, num_heads, ff_dim))
             .collect();
 
         Ok(Self { embed, blocks })
     }
+
+    pub fn naive_fwd(x: &mut Array2<f32>) -> Result<Array1<f32>, ErrBox> {
+        unimplemented!()
+    }
 }
 
 pub struct TransformerBlock {
-    query: Array2<f32>,
-    key: Array2<f32>,
-    value: Array2<f32>,
-    ln: Array1<f32>,
+    num_heads: usize,
+    head_size: usize,
+    query: Array3<f32>,
+    key: Array3<f32>,
+    value: Array3<f32>,
+    ff1: Array2<f32>,
+    ff2: Array2<f32>,
     out: Array2<f32>,
 }
 
 impl TransformerBlock {
-    pub fn new(embed_dim: usize, num_heads: usize, ff_dim: usize, dropout: f32) -> Self {
-        let rand_boundary = dims2rand_boundary(embed_dim, embed_dim);
-        let rand_dist = Uniform::new(-rand_boundary, rand_boundary);
+    pub fn new(embed_dim: usize, num_heads: usize, ff_dim: usize) -> Self {
+        let head_size = embed_dim / num_heads;
 
-        let query = Array2::random((embed_dim, embed_dim), rand_dist);
-        let key = Array2::random((embed_dim, embed_dim), rand_dist);
-        let value = Array2::random((embed_dim, embed_dim), rand_dist);
+        let qkv_rand_dist = dims2rand_dist(vec![num_heads, head_size, embed_dim].as_slice());
 
-	let ln_rand_boundary = dims2rand_boundary(1, embed_dim);
-        let ln = Array1::random(embed_dim, Uniform::new(-ln_rand_boundary, ln_rand_boundary));
+        let qkv_dims = (num_heads, embed_dim, head_size);
 
-        let out = Array2::random((embed_dim, embed_dim), rand_dist);
+        let query = Array3::random(qkv_dims, qkv_rand_dist);
+        let key = Array3::random(qkv_dims, qkv_rand_dist);
+        let value = Array3::random(qkv_dims, qkv_rand_dist);
+
+        let ff_rand_dist = dims2rand_dist(vec![embed_dim, ff_dim].as_slice());
+
+        let ff1 = Array2::random((embed_dim, ff_dim), ff_rand_dist);
+        let ff2 = Array2::random((ff_dim, embed_dim), ff_rand_dist);
+
+        let out = Array2::random((embed_dim, embed_dim), qkv_rand_dist);
         Self {
+            num_heads,
+            head_size,
             query,
             key,
             value,
-            ln,
+            ff1,
+            ff2,
             out,
         }
+    }
+
+    pub fn naive_fwd(&self, x: &mut Array2<f32>) -> Result<(), ErrBox> {
+        // T = token count, C = embed dim
+
+        // (T, C)
+        let x_shp: Vec<AxisDescription> = x.axes().collect();
+
+        let tril: Array2<u8> = Array2::ones((x_shp[0].len, x_shp[0].len)).tril(0);
+
+        // ATTENTION
+
+        let x_qkv_shp = (self.num_heads, x_shp[0].len, self.head_size);
+
+	// X @ Q
+        let mut x_qs: Array3<f32> = Array3::zeros(x_qkv_shp);
+
+        Zip::from(x_qs.outer_iter_mut())
+            .and(self.query.outer_iter())
+            .par_for_each(|mut x_qs_slice, q_slice| {
+                x_qs_slice.assign(&x.dot(&q_slice));
+            });
+
+
+	// X @ K
+        let mut x_ks: Array3<f32> = Array3::zeros(x_qkv_shp);
+
+        Zip::from(x_ks.outer_iter_mut())
+            .and(self.key.outer_iter())
+            .par_for_each(|mut x_ks_slice, k_slice| {
+                x_ks_slice.assign(&x.dot(&k_slice));
+            });
+
+	// X @ V
+        let mut x_vs: Array3<f32> = Array3::zeros(x_qkv_shp);
+
+        Zip::from(x_vs.outer_iter_mut())
+            .and(self.value.outer_iter())
+            .par_for_each(|mut x_vs_slice, v_slice| {
+                x_vs_slice.assign(&x.dot(&v_slice));
+            });
+
+	// softmax(mask(Q @ K)) / sqrt(head_size)
+        let mut xqxk: Array3<f32> = Array3::zeros((self.num_heads, x_shp[0].len, x_shp[0].len));
+
+        Zip::from(xqxk.outer_iter_mut())
+            .and(x_qs.outer_iter())
+            .and(x_ks.outer_iter())
+            .par_for_each(|mut xqxk_slice, x_qs_slice, x_ks_slice| {
+                let mut matmul_prod = x_qs_slice.dot(&x_ks_slice.t());
+
+                // Mask off future tokens
+                Zip::from(&mut matmul_prod)
+                    .and(&tril)
+                    .par_for_each(|prod_elem, tril_elem| {
+                        if *tril_elem == 0 {
+                            *prod_elem = f32::NEG_INFINITY;
+                        }
+                    });
+
+                // Softmax
+                Zip::from(matmul_prod.rows_mut()).par_for_each(|mut row| {
+                    let row_exp = row.exp();
+
+                    let sum = row_exp.sum();
+
+                    row.assign(&(row_exp / sum));
+
+		    // Divide by sqrt(head_size) to normalize
+		    row /= (self.head_size as f32).sqrt();
+                });
+
+                xqxk_slice.assign(&matmul_prod);
+            });
+
+        let mut atn_out: Array3<f32> =
+            Array3::zeros((self.num_heads, x_shp[0].len, self.head_size));
+
+        Zip::from(atn_out.outer_iter_mut())
+            .and(xqxk.outer_iter())
+            .and(x_vs.outer_iter())
+            .par_for_each(|mut atn_out_slice, xqxk_slice, x_vs_slice| {
+                atn_out_slice.assign(&xqxk_slice.dot(&x_vs_slice));
+            });
+
+        // (num_heads, T, head_size) -> (T, C)
+        let atn_out_reshaped = atn_out.to_shape((x_shp[0].len, x_shp[1].len))?;
+
+        *x += &atn_out_reshaped;
+
+        // MLP
+        let x_ff1: Array2<f32> = x.dot(&self.ff1);
+
+        let x_ff2: Array2<f32> = x_ff1.dot(&self.ff2);
+
+        *x += &x_ff2;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tb_naive_fwd_has_correct_output_dims() -> Result<(), ErrBox> {
+        let embed_dim = 64;
+        let tb = TransformerBlock::new(embed_dim, 8, 15);
+
+        let mut x = Array2::random((42, embed_dim), Uniform::new(-5.0, 5.0));
+
+        let axes_before: Vec<_> = x.axes().collect();
+
+        tb.naive_fwd(&mut x)?;
+
+        let axes_after: Vec<_> = x.axes().collect();
+
+        for (before, after) in axes_before.iter().zip(axes_after.iter()) {
+            assert_eq!(before.len, after.len);
+            assert_eq!(before.stride, after.stride);
+        }
+
+        Ok(())
     }
 }
