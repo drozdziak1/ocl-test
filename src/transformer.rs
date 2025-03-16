@@ -266,6 +266,7 @@ impl TransformerBlock {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -287,5 +288,18 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_transformer_naive_fwd_happy_path() -> Result<(), ErrBox> {
+	let ctx_size = 32_000;
+	let embed_dim = 64;
+	let vocab_size = 15;
+
+	let t = Transformer::new(ctx_size, vocab_size, embed_dim, 32, 16, 18)?;
+
+	let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice())?;
+
+	Ok(())
     }
 }
