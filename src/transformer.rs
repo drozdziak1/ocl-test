@@ -1,5 +1,5 @@
 use crate::util::ErrBox;
-use ndarray::{Array1, Array2, Array3, AxisDescription, Zip};
+use ndarray::{Array1, Array2, Array3, Axis, AxisDescription, Order, Zip};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -14,7 +14,8 @@ fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
     let prod_sqrt = dims
         .iter()
         .fold(1.0, |acc, elem| acc * (*elem) as f32)
-        .sqrt();
+        .sqrt()
+        .powi(-1);
     Uniform::new(-prod_sqrt, prod_sqrt)
 }
 
@@ -55,11 +56,15 @@ pub struct TransformerBlock {
     num_heads: usize,
     head_size: usize,
     query: Array3<f32>,
+    query_grads: Array3<f32>,
     key: Array3<f32>,
+    key_grads: Array3<f32>,
     value: Array3<f32>,
+    value_grads: Array3<f32>,
     ff1: Array2<f32>,
+    ff1_grads: Array2<f32>,
     ff2: Array2<f32>,
-    out: Array2<f32>,
+    ff2_grads: Array2<f32>,
 }
 
 impl TransformerBlock {
@@ -71,24 +76,35 @@ impl TransformerBlock {
         let qkv_dims = (num_heads, embed_dim, head_size);
 
         let query = Array3::random(qkv_dims, qkv_rand_dist);
+        let query_grads = Array3::zeros(qkv_dims);
+
         let key = Array3::random(qkv_dims, qkv_rand_dist);
+        let key_grads = Array3::zeros(qkv_dims);
+
         let value = Array3::random(qkv_dims, qkv_rand_dist);
+        let value_grads = Array3::zeros(qkv_dims);
 
         let ff_rand_dist = dims2rand_dist(vec![embed_dim, ff_dim].as_slice());
 
         let ff1 = Array2::random((embed_dim, ff_dim), ff_rand_dist);
-        let ff2 = Array2::random((ff_dim, embed_dim), ff_rand_dist);
+        let ff1_grads = Array2::zeros((embed_dim, ff_dim));
 
-        let out = Array2::random((embed_dim, embed_dim), qkv_rand_dist);
+        let ff2 = Array2::random((ff_dim, embed_dim), ff_rand_dist);
+        let ff2_grads = Array2::zeros((ff_dim, embed_dim));
+
         Self {
             num_heads,
             head_size,
             query,
+	    query_grads,
             key,
+	    key_grads,
             value,
+	    value_grads,
             ff1,
+	    ff1_grads,
             ff2,
-            out,
+	    ff2_grads,
         }
     }
 
@@ -104,7 +120,7 @@ impl TransformerBlock {
 
         let x_qkv_shp = (self.num_heads, x_shp[0].len, self.head_size);
 
-	// X @ Q
+        // X @ Q
         let mut x_qs: Array3<f32> = Array3::zeros(x_qkv_shp);
 
         Zip::from(x_qs.outer_iter_mut())
@@ -113,8 +129,7 @@ impl TransformerBlock {
                 x_qs_slice.assign(&x.dot(&q_slice));
             });
 
-
-	// X @ K
+        // X @ K
         let mut x_ks: Array3<f32> = Array3::zeros(x_qkv_shp);
 
         Zip::from(x_ks.outer_iter_mut())
@@ -123,7 +138,7 @@ impl TransformerBlock {
                 x_ks_slice.assign(&x.dot(&k_slice));
             });
 
-	// X @ V
+        // X @ V
         let mut x_vs: Array3<f32> = Array3::zeros(x_qkv_shp);
 
         Zip::from(x_vs.outer_iter_mut())
@@ -132,7 +147,7 @@ impl TransformerBlock {
                 x_vs_slice.assign(&x.dot(&v_slice));
             });
 
-	// softmax(mask(Q @ K)) / sqrt(head_size)
+        // softmax(mask(Q @ K)) / sqrt(head_size)
         let mut xqxk: Array3<f32> = Array3::zeros((self.num_heads, x_shp[0].len, x_shp[0].len));
 
         Zip::from(xqxk.outer_iter_mut())
@@ -158,8 +173,10 @@ impl TransformerBlock {
 
                     row.assign(&(row_exp / sum));
 
-		    // Divide by sqrt(head_size) to normalize
-		    row /= (self.head_size as f32).sqrt();
+                    let sum = row.sum();
+
+                    // Divide by sqrt(head_size) to normalize
+                    row /= (self.head_size as f32).sqrt();
                 });
 
                 xqxk_slice.assign(&matmul_prod);
@@ -176,7 +193,21 @@ impl TransformerBlock {
             });
 
         // (num_heads, T, head_size) -> (T, C)
-        let atn_out_reshaped = atn_out.to_shape((x_shp[0].len, x_shp[1].len))?;
+        let mut atn_out_reshaped: Array2<f32> = Array2::zeros((x_shp[0].len, x_shp[1].len));
+
+        Zip::from(atn_out_reshaped.rows_mut())
+            .and(atn_out.axis_iter(Axis(1)))
+            .par_for_each(|mut reshaped_row, atn_out_slice| {
+                let new_row = atn_out_slice
+                    .to_shape(((x_shp[1].len), Order::RowMajor))
+                    .expect(&format!(
+                        "Could not reshape {:?} to {:?}",
+                        atn_out_slice.dim(),
+                        (1, x_shp[1].len)
+                    ));
+
+                reshaped_row.assign(&new_row);
+            });
 
         *x += &atn_out_reshaped;
 
@@ -189,6 +220,10 @@ impl TransformerBlock {
 
         Ok(())
     }
+
+    pub fn naive_bwd(&mut self) -> Result<(), ErrBox> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -197,8 +232,8 @@ mod tests {
 
     #[test]
     fn test_tb_naive_fwd_has_correct_output_dims() -> Result<(), ErrBox> {
-        let embed_dim = 64;
-        let tb = TransformerBlock::new(embed_dim, 8, 15);
+        let embed_dim = 8;
+        let tb = TransformerBlock::new(embed_dim, 2, 15);
 
         let mut x = Array2::random((42, embed_dim), Uniform::new(-5.0, 5.0));
 
