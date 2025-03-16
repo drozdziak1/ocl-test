@@ -4,11 +4,6 @@ use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-pub struct Transformer {
-    embed: Array2<f32>,
-    blocks: Vec<TransformerBlock>,
-}
-
 /// Computes the range for tensor randomization
 fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
     let prod_sqrt = dims
@@ -19,10 +14,32 @@ fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
     Uniform::new(-prod_sqrt, prod_sqrt)
 }
 
+fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
+    let mut out = Array2::zeros(a.dim());
+
+    Zip::from(out.axis_iter_mut(ax))
+        .and(a.axis_iter(ax))
+        .par_for_each(|mut out_slice, a_slice| {
+            let a_exp = a_slice.exp();
+            let sum = a_exp.sum();
+
+            out_slice.assign(&(a_exp / sum));
+        });
+
+    return out;
+}
+
+pub struct Transformer {
+    embed_dim: usize,
+    unembed: Array2<f32>,
+    embed: Array2<f32>,
+    blocks: Vec<TransformerBlock>,
+}
+
 impl Transformer {
     pub fn new(
         ctx_width: usize,
-        vocab_size: usize,
+        vocab_size: usize, // Note: corresponds with the last token ID in the tokenizer
         embed_dim: usize,
         num_layers: usize,
         num_heads: usize,
@@ -40,15 +57,46 @@ impl Transformer {
 
         let embed = Array2::random((vocab_size, embed_dim), rand_dist);
 
+        let unembed = Array2::random((embed_dim, vocab_size), rand_dist);
+
         let blocks = (0..num_layers)
             .map(|_i| TransformerBlock::new(embed_dim, num_heads, ff_dim))
             .collect();
 
-        Ok(Self { embed, blocks })
+        Ok(Self {
+            embed_dim,
+            unembed,
+            embed,
+            blocks,
+        })
     }
 
-    pub fn naive_fwd(x: &mut Array2<f32>) -> Result<Array1<f32>, ErrBox> {
-        unimplemented!()
+    pub fn naive_fwd(&self, x: &[u32]) -> Result<Array1<f32>, ErrBox> {
+        let mut x_embedded: Array2<f32> = Array2::zeros((x.len(), self.embed_dim));
+
+        Zip::from(x_embedded.outer_iter_mut())
+            .and(x)
+            .par_for_each(|mut embedded_row, tok_id| {
+                let embedding = self.embed.index_axis(Axis(0), *tok_id as usize); // NOTE: panics if index out of bounds
+
+                embedded_row.assign(&embedding);
+            });
+
+        for block in self.blocks.iter() {
+            block.naive_fwd(&mut x_embedded)?;
+        }
+
+        let last_refined_embedding = x_embedded
+            .axis_iter(Axis(0))
+            .next_back()
+            .ok_or_else(|| "Could not get last element of X!")?;
+
+	let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
+
+	// prediction = softmax(x[last, ..] @ self.unembed)
+        let mut prediction = softmax_axis(&last_refined_embedding.dot(&self.unembed), Axis(0));
+
+	Ok(prediction.remove_axis(Axis(0)))
     }
 }
 
@@ -96,15 +144,15 @@ impl TransformerBlock {
             num_heads,
             head_size,
             query,
-	    query_grads,
+            query_grads,
             key,
-	    key_grads,
+            key_grads,
             value,
-	    value_grads,
+            value_grads,
             ff1,
-	    ff1_grads,
+            ff1_grads,
             ff2,
-	    ff2_grads,
+            ff2_grads,
         }
     }
 
@@ -166,20 +214,10 @@ impl TransformerBlock {
                     });
 
                 // Softmax
-                Zip::from(matmul_prod.rows_mut()).par_for_each(|mut row| {
-                    let row_exp = row.exp();
+                let normalized =
+                    softmax_axis(&matmul_prod, Axis(0)) / (self.head_size as f32).sqrt();
 
-                    let sum = row_exp.sum();
-
-                    row.assign(&(row_exp / sum));
-
-                    let sum = row.sum();
-
-                    // Divide by sqrt(head_size) to normalize
-                    row /= (self.head_size as f32).sqrt();
-                });
-
-                xqxk_slice.assign(&matmul_prod);
+                xqxk_slice.assign(&normalized);
             });
 
         let mut atn_out: Array3<f32> =
