@@ -34,17 +34,15 @@ fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
 fn approx_gelu<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
     let mut out = Array::zeros(a.dim());
 
-    Zip::from(&mut out)
-        .and(a)
-        .par_for_each(|out_elem, a_elem| {
-	    // sigmoid(x * 1.702)
-	    let sigmoid1702 = 1.0 / (1.0 + (-1.702 * a_elem).exp());
+    Zip::from(&mut out).and(a).par_for_each(|out_elem, a_elem| {
+        // sigmoid(x * 1.702)
+        let sigmoid1702 = 1.0 / (1.0 + (-1.702 * a_elem).exp());
 
-	    // GELU(x) ~= x * sigmoid(x * 1.702)
-	    let gelu_approx = a_elem * sigmoid1702;
+        // GELU(x) ~= x * sigmoid(x * 1.702)
+        let gelu_approx = a_elem * sigmoid1702;
 
-	    *out_elem = gelu_approx;
-	});
+        *out_elem = gelu_approx;
+    });
     out
 }
 
@@ -122,6 +120,7 @@ impl Transformer {
 pub struct TransformerBlock {
     num_heads: usize,
     head_size: usize,
+    ff_dim: usize,
     query: Array3<f32>,
     query_grads: Array3<f32>,
     key: Array3<f32>,
@@ -129,8 +128,10 @@ pub struct TransformerBlock {
     value: Array3<f32>,
     value_grads: Array3<f32>,
     ff1: Array2<f32>,
+    ff1_b: Array2<f32>,
     ff1_grads: Array2<f32>,
     ff2: Array2<f32>,
+    ff2_b: Array2<f32>,
     ff2_grads: Array2<f32>,
 }
 
@@ -154,14 +155,20 @@ impl TransformerBlock {
         let ff_rand_dist = dims2rand_dist(vec![embed_dim, ff_dim].as_slice());
 
         let ff1 = Array2::random((embed_dim, ff_dim), ff_rand_dist);
+        let ff1_b = Array2::random((1, ff_dim), dims2rand_dist(vec![ff_dim].as_slice()));
+
         let ff1_grads = Array2::zeros((embed_dim, ff_dim));
 
         let ff2 = Array2::random((ff_dim, embed_dim), ff_rand_dist);
+        let ff2_b = Array2::random((1, embed_dim), dims2rand_dist(vec![embed_dim].as_slice()));
+
         let ff2_grads = Array2::zeros((ff_dim, embed_dim));
 
         Self {
             num_heads,
             head_size,
+            ff_dim,
+
             query,
             query_grads,
             key,
@@ -169,8 +176,10 @@ impl TransformerBlock {
             value,
             value_grads,
             ff1,
+            ff1_b,
             ff1_grads,
             ff2,
+            ff2_b,
             ff2_grads,
         }
     }
@@ -269,9 +278,27 @@ impl TransformerBlock {
         *x += &atn_out_reshaped;
 
         // MLP
-        let x_ff1: Array2<f32> = approx_gelu(&x.dot(&self.ff1));
 
-        let x_ff2: Array2<f32> = approx_gelu(&x_ff1.dot(&self.ff2));
+	// Xff1 = GELU(X @ ff1 + ff1_b)
+        let x_ff1_dims = (x_shp[0].len, self.ff_dim);
+        let ff1_b_broadcast = self.ff1_b.broadcast(x_ff1_dims).expect(&format!(
+            "Could not broadcast ff1_b to dimensions {:?}",
+            x_ff1_dims
+        ));
+
+        let x_ff1: Array2<f32> = approx_gelu(&(x.dot(&self.ff1) + &ff1_b_broadcast));
+
+	// Xff2 = GELU(Xff1 @ ff2 + ff2_b)
+        let x_ff2_dims = (x_shp[0].len, x_shp[1].len);
+        let ff2_b_broadcast = self
+            .ff2_b
+            .broadcast((x_shp[0].len, x_shp[1].len))
+            .expect(&format!(
+                "Could not broadcast ff2_b to dimensions {:?}",
+                x_ff2_dims
+            ));
+
+        let x_ff2: Array2<f32> = approx_gelu(&(x_ff1.dot(&self.ff2) + &ff2_b_broadcast));
 
         *x += &x_ff2;
 
