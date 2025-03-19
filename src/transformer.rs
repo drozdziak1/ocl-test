@@ -6,7 +6,8 @@ use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-/// Computes the range for tensor randomization
+/// Computes the range for tensor randomization. Randomization is
+/// uniform in range (-l, l) where l = 1/sqrt(product(dim0, dim1, ...))
 fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
     let prod_sqrt = dims
         .iter()
@@ -16,6 +17,7 @@ fn dims2rand_dist(dims: &[usize]) -> Uniform<f32> {
     Uniform::new(-prod_sqrt, prod_sqrt)
 }
 
+/// Performs softmax on the selected axis
 fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
     let mut out = Array2::zeros(a.dim());
 
@@ -31,6 +33,7 @@ fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
     return out;
 }
 
+/// Naive GELU approximation
 fn approx_gelu<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
     let mut out = Array::zeros(a.dim());
 
