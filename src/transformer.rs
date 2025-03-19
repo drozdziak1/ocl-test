@@ -1,5 +1,7 @@
 use crate::util::ErrBox;
-use ndarray::{Array1, Array2, Array3, Axis, AxisDescription, Order, Zip};
+use ndarray::{
+    Array, Array1, Array2, Array3, ArrayBase, Axis, AxisDescription, Dimension, Order, Zip,
+};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -27,6 +29,23 @@ fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
         });
 
     return out;
+}
+
+fn approx_gelu<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
+    let mut out = Array::zeros(a.dim());
+
+    Zip::from(&mut out)
+        .and(a)
+        .par_for_each(|out_elem, a_elem| {
+	    // sigmoid(x * 1.702)
+	    let sigmoid1702 = 1.0 / (1.0 + (-1.702 * a_elem).exp());
+
+	    // GELU(x) ~= x * sigmoid(x * 1.702)
+	    let gelu_approx = a_elem * sigmoid1702;
+
+	    *out_elem = gelu_approx;
+	});
+    out
 }
 
 pub struct Transformer {
@@ -91,12 +110,12 @@ impl Transformer {
             .next_back()
             .ok_or_else(|| "Could not get last element of X!")?;
 
-	let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
+        let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
 
-	// prediction = softmax(x[last, ..] @ self.unembed)
+        // prediction = softmax(x[last, ..] @ self.unembed)
         let mut prediction = softmax_axis(&last_refined_embedding.dot(&self.unembed), Axis(0));
 
-	Ok(prediction.remove_axis(Axis(0)))
+        Ok(prediction.remove_axis(Axis(0)))
     }
 }
 
@@ -250,9 +269,9 @@ impl TransformerBlock {
         *x += &atn_out_reshaped;
 
         // MLP
-        let x_ff1: Array2<f32> = x.dot(&self.ff1);
+        let x_ff1: Array2<f32> = approx_gelu(&x.dot(&self.ff1));
 
-        let x_ff2: Array2<f32> = x_ff1.dot(&self.ff2);
+        let x_ff2: Array2<f32> = approx_gelu(&x_ff1.dot(&self.ff2));
 
         *x += &x_ff2;
 
@@ -292,14 +311,14 @@ mod tests {
 
     #[test]
     fn test_transformer_naive_fwd_happy_path() -> Result<(), ErrBox> {
-	let ctx_size = 32_000;
-	let embed_dim = 64;
-	let vocab_size = 15;
+        let ctx_size = 32_000;
+        let embed_dim = 64;
+        let vocab_size = 15;
 
-	let t = Transformer::new(ctx_size, vocab_size, embed_dim, 32, 16, 18)?;
+        let t = Transformer::new(ctx_size, vocab_size, embed_dim, 32, 16, 18)?;
 
-	let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice())?;
+        let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice())?;
 
-	Ok(())
+        Ok(())
     }
 }
