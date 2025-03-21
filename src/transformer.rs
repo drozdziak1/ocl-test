@@ -1,3 +1,5 @@
+use std::iter::repeat;
+
 use crate::util::ErrBox;
 use ndarray::{
     Array, Array1, Array2, Array3, ArrayBase, Axis, AxisDescription, Dimension, Order, Zip,
@@ -72,6 +74,18 @@ pub struct Transformer {
     blocks: Vec<TransformerBlock>,
 }
 
+#[derive(Default)]
+pub struct TransformerTrainData {
+    /// X @ embed
+    x_embedded: Array2<f32>,
+    /// Train data for each attention head
+    tb_train_data: Vec<TBTrainData>,
+    /// last row of X after all transformer blocks add their output to it
+    last_refined_embedding: Array2<f32>,
+    /// softmax(last_refined_embedding)
+    prediction: Array2<f32>,
+}
+
 impl Transformer {
     pub fn new(
         ctx_width: usize,
@@ -107,7 +121,11 @@ impl Transformer {
         })
     }
 
-    pub fn naive_fwd(&self, x: &[u32]) -> Result<Array1<f32>, ErrBox> {
+    pub fn naive_fwd(
+        &self,
+        x: &[u32],
+        mut train_data: Option<&mut TransformerTrainData>,
+    ) -> Result<Array1<f32>, ErrBox> {
         let mut x_embedded: Array2<f32> = Array2::zeros((x.len(), self.embed_dim));
 
         Zip::from(x_embedded.outer_iter_mut())
@@ -118,25 +136,41 @@ impl Transformer {
                 embedded_row.assign(&embedding);
             });
 
+        let mut tb_train_data_iter = train_data
+            .iter_mut()
+            .map(|train_data| train_data.tb_train_data.iter_mut())
+            .flatten();
+
         for block in self.blocks.iter() {
-            block.naive_fwd(&mut x_embedded)?;
+            block.naive_fwd(&mut x_embedded, tb_train_data_iter.next())?;
         }
 
         let last_refined_embedding = x_embedded
             .axis_iter(Axis(0))
             .next_back()
-            .ok_or_else(|| "Could not get last element of X!")?;
+            .ok_or_else(|| "Could not get last element of X!")?.to_owned();
 
         let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
 
         // prediction = softmax(x[last; ..] @ self.unembed)
-        let mut prediction = softmax_axis(&last_refined_embedding.dot(&self.unembed), Axis(0));
+        let prediction = softmax_axis(&last_refined_embedding.dot(&self.unembed), Axis(0));
+
+	if let Some(train_data) = train_data {
+	    train_data.x_embedded = x_embedded;
+	    train_data.last_refined_embedding = last_refined_embedding;
+	    train_data.prediction = prediction.clone();
+	}
 
         Ok(prediction.remove_axis(Axis(0)))
     }
 
-    pub fn naive_bwd(&self, lr: f32, y_hat: &Array1<f32>, y_gt: &Array1<f32>) -> Result<(), ErrBox> {
-	Ok(())
+    pub fn naive_bwd(
+        &self,
+        lr: f32,
+        y_hat: &Array1<f32>,
+        y_gt: &Array1<f32>,
+    ) -> Result<(), ErrBox> {
+        Ok(())
     }
 }
 
@@ -145,17 +179,41 @@ pub struct TransformerBlock {
     head_size: usize,
     ff_dim: usize,
     query: Array3<f32>,
-    query_grads: Array3<f32>,
     key: Array3<f32>,
-    key_grads: Array3<f32>,
     value: Array3<f32>,
-    value_grads: Array3<f32>,
     ff1: Array2<f32>,
     ff1_b: Array2<f32>,
-    ff1_grads: Array2<f32>,
     ff2: Array2<f32>,
     ff2_b: Array2<f32>,
-    ff2_grads: Array2<f32>,
+}
+
+/// Intermediate state of X as it goes through the TransformerBlock; used for training
+#[derive(Default)]
+pub struct TBTrainData {
+    /// X @ Q per attention head
+    x_qs: Array3<f32>,
+    /// X @ K per attention head
+    x_ks: Array3<f32>,
+    /// X @ V per attention head
+    x_vs: Array3<f32>,
+    /// Xq @ Xk per attention head
+    xqxk: Array3<f32>,
+    /// XqXk @ Xv, all attention heads
+    atn_out_reshaped: Array2<f32>,
+    /// (X + atn_out_reshaped) @ ff1
+    x_ff1: Array2<f32>,
+    /// Xff1 + ff1_b
+    x_ff1_b: Array2<f32>,
+    /// GELU(Xff1_b)
+    x_ff1_act: Array2<f32>,
+    /// Xff1_act @ ff2
+    x_ff2: Array2<f32>,
+    /// Xff2 + ff2_b
+    x_ff2_b: Array2<f32>,
+    /// GELU(Xff2_b)
+    x_ff2_act: Array2<f32>,
+    /// X + atn_out_reshape + X_ff2_act
+    x_out: Array2<f32>,
 }
 
 impl TransformerBlock {
@@ -167,25 +225,18 @@ impl TransformerBlock {
         let qkv_dims = (num_heads, embed_dim, head_size);
 
         let query = Array3::random(qkv_dims, qkv_rand_dist);
-        let query_grads = Array3::zeros(qkv_dims);
 
         let key = Array3::random(qkv_dims, qkv_rand_dist);
-        let key_grads = Array3::zeros(qkv_dims);
 
         let value = Array3::random(qkv_dims, qkv_rand_dist);
-        let value_grads = Array3::zeros(qkv_dims);
 
         let ff_rand_dist = dims2rand_dist(vec![embed_dim, ff_dim].as_slice());
 
         let ff1 = Array2::random((embed_dim, ff_dim), ff_rand_dist);
         let ff1_b = Array2::random((1, ff_dim), dims2rand_dist(vec![ff_dim].as_slice()));
 
-        let ff1_grads = Array2::zeros((embed_dim, ff_dim));
-
         let ff2 = Array2::random((ff_dim, embed_dim), ff_rand_dist);
         let ff2_b = Array2::random((1, embed_dim), dims2rand_dist(vec![embed_dim].as_slice()));
-
-        let ff2_grads = Array2::zeros((ff_dim, embed_dim));
 
         Self {
             num_heads,
@@ -193,21 +244,20 @@ impl TransformerBlock {
             ff_dim,
 
             query,
-            query_grads,
             key,
-            key_grads,
             value,
-            value_grads,
             ff1,
             ff1_b,
-            ff1_grads,
             ff2,
             ff2_b,
-            ff2_grads,
         }
     }
 
-    pub fn naive_fwd(&self, x: &mut Array2<f32>) -> Result<(), ErrBox> {
+    pub fn naive_fwd(
+        &self,
+        x: &mut Array2<f32>,
+        train_data: Option<&mut TBTrainData>,
+    ) -> Result<(), ErrBox> {
         // T = token count, C = embed dim
 
         // (T, C)
@@ -309,7 +359,11 @@ impl TransformerBlock {
             x_ff1_dims
         ));
 
-        let x_ff1: Array2<f32> = x.dot(&self.ff1) + &ff1_b_broadcast;
+        let x_ff1: Array2<f32> = x.dot(&self.ff1);
+
+        let x_ff1_b: Array2<f32> = &x_ff1 + &ff1_b_broadcast;
+
+        let x_ff1_act: Array2<f32> = approx_gelu(&x_ff1_b);
 
         // Xff2 = GELU(Xff1 @ ff2 + ff2_b)
         let x_ff2_dims = (x_shp[0].len, x_shp[1].len);
@@ -321,9 +375,13 @@ impl TransformerBlock {
                 x_ff2_dims
             ));
 
-        let x_ff2: Array2<f32> = approx_gelu(&(x_ff1.dot(&self.ff2) + &ff2_b_broadcast));
+        let x_ff2: Array2<f32> = x_ff1_act.dot(&self.ff2);
 
-        *x += &x_ff2;
+        let x_ff2_b: Array2<f32> = &x_ff2 + &ff2_b_broadcast;
+
+        let x_ff2_act: Array2<f32> = approx_gelu(&x_ff2_b);
+
+        *x += &x_ff2_act;
 
         Ok(())
     }
@@ -347,7 +405,7 @@ mod tests {
 
         let axes_before: Vec<_> = x.axes().collect();
 
-        tb.naive_fwd(&mut x)?;
+        tb.naive_fwd(&mut x, None)?;
 
         let axes_after: Vec<_> = x.axes().collect();
 
@@ -367,14 +425,15 @@ mod tests {
 
         let t = Transformer::new(ctx_size, vocab_size, embed_dim, 32, 16, 18)?;
 
-        let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice())?;
+	let mut train_data = TransformerTrainData::default();
 
-	// one-hot for token number 6
-	let mut expected = Array1::zeros(vocab_size);
-	expected[5] = 1.0;
+        let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice(), Some(&mut train_data))?;
 
-	t.naive_bwd(0.001, &pred, &expected)?;
+        // one-hot for token number 6
+        let mut expected = Array1::zeros(vocab_size);
+        expected[5] = 1.0;
 
+        t.naive_bwd(0.001, &pred, &expected)?;
 
         Ok(())
     }
