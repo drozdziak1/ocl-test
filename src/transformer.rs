@@ -42,9 +42,25 @@ fn approx_gelu<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
         let sigmoid1702 = 1.0 / (1.0 + (-1.702 * a_elem).exp());
 
         // GELU(x) ~= x * sigmoid(x * 1.702)
-        let gelu_approx = a_elem * sigmoid1702;
+        let approx_gelu = a_elem * sigmoid1702;
 
-        *out_elem = gelu_approx;
+        *out_elem = approx_gelu;
+    });
+    out
+}
+
+fn approx_gelu_grad<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
+    let mut out = Array::zeros(a.dim());
+
+    Zip::from(&mut out).and(a).par_for_each(|out_elem, a_elem| {
+        let x1702 = 1.702 * a_elem;
+
+        // sigmoid(x * 1.702)
+        let sigmoid1702 = 1.0 / (1.0 + (x1702).exp());
+
+        let approx_gelu_grad = sigmoid1702 * (1.0 + x1702 * (1.0 - sigmoid1702));
+
+        *out_elem = approx_gelu_grad;
     });
     out
 }
@@ -113,10 +129,14 @@ impl Transformer {
 
         let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
 
-        // prediction = softmax(x[last, ..] @ self.unembed)
+        // prediction = softmax(x[last; ..] @ self.unembed)
         let mut prediction = softmax_axis(&last_refined_embedding.dot(&self.unembed), Axis(0));
 
         Ok(prediction.remove_axis(Axis(0)))
+    }
+
+    pub fn naive_bwd(&self, lr: f32, y_hat: &Array1<f32>, y_gt: &Array1<f32>) -> Result<(), ErrBox> {
+	Ok(())
     }
 }
 
@@ -282,16 +302,16 @@ impl TransformerBlock {
 
         // MLP
 
-	// Xff1 = GELU(X @ ff1 + ff1_b)
+        // Xff1 = GELU(X @ ff1 + ff1_b)
         let x_ff1_dims = (x_shp[0].len, self.ff_dim);
         let ff1_b_broadcast = self.ff1_b.broadcast(x_ff1_dims).expect(&format!(
             "Could not broadcast ff1_b to dimensions {:?}",
             x_ff1_dims
         ));
 
-        let x_ff1: Array2<f32> = approx_gelu(&(x.dot(&self.ff1) + &ff1_b_broadcast));
+        let x_ff1: Array2<f32> = x.dot(&self.ff1) + &ff1_b_broadcast;
 
-	// Xff2 = GELU(Xff1 @ ff2 + ff2_b)
+        // Xff2 = GELU(Xff1 @ ff2 + ff2_b)
         let x_ff2_dims = (x_shp[0].len, x_shp[1].len);
         let ff2_b_broadcast = self
             .ff2_b
@@ -342,12 +362,19 @@ mod tests {
     #[test]
     fn test_transformer_naive_fwd_happy_path() -> Result<(), ErrBox> {
         let ctx_size = 32_000;
-        let embed_dim = 64;
+        let embed_dim = 32;
         let vocab_size = 15;
 
         let t = Transformer::new(ctx_size, vocab_size, embed_dim, 32, 16, 18)?;
 
         let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice())?;
+
+	// one-hot for token number 6
+	let mut expected = Array1::zeros(vocab_size);
+	expected[5] = 1.0;
+
+	t.naive_bwd(0.001, &pred, &expected)?;
+
 
         Ok(())
     }
