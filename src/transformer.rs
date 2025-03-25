@@ -1,4 +1,4 @@
-use std::iter::repeat;
+use std::{iter::repeat, thread, time::Duration};
 
 use crate::util::ErrBox;
 use ndarray::{
@@ -80,12 +80,12 @@ pub struct TransformerTrainData {
     x_embedded: Array2<f32>,
     /// Train data for each attention head
     tb_train_data: Vec<TBTrainData>,
-    /// last row of X after all transformer blocks add their output to it
-    last_refined_embedding: Array2<f32>,
+    /// X after each attention block's contribution is added
+    x_refined: Array2<f32>,
     /// last_refined_embedding @ unembed
-    pred_raw: Array2<f32>,
+    predictions_raw: Array2<f32>,
     /// softmax(pred_raw)
-    prediction: Array2<f32>,
+    predictions: Array2<f32>,
 }
 
 impl Transformer {
@@ -146,58 +146,49 @@ impl Transformer {
 
         let mut tb_train_data_iter = tb_train_data.iter_mut();
 
+        let mut x_refined = x_embedded.clone();
+
         for block in self.blocks.iter() {
-            block.naive_fwd(&mut x_embedded, tb_train_data_iter.next())?;
+            block.naive_fwd(&mut x_refined, tb_train_data_iter.next())?;
         }
 
-        let last_refined_embedding = x_embedded
-            .axis_iter(Axis(0))
-            .next_back()
-            .ok_or_else(|| "Could not get last element of X!")?
-            .to_owned();
+        // pred_raw = x_embedded @ self.unembed
+        let predictions_raw = x_embedded.dot(&self.unembed);
 
-        let last_refined_embedding = last_refined_embedding.insert_axis(Axis(0));
-
-        // pred_raw = x[last] @ self.unembed
-        let pred_raw = &last_refined_embedding.dot(&self.unembed);
-
-        // prediction = softmax(pred_raw)
-        let prediction = softmax_axis(&pred_raw, Axis(0));
+        // predictions = softmax(pred_raw)
+        let predictions = softmax_axis(&predictions_raw, Axis(0));
 
         if let Some(train_data) = train_data {
             train_data.x_embedded = x_embedded;
             train_data.tb_train_data = tb_train_data;
-            train_data.last_refined_embedding = last_refined_embedding;
-            train_data.pred_raw = pred_raw.clone();
-            train_data.prediction = prediction.clone();
+            train_data.x_refined = x_refined;
+            train_data.predictions_raw = predictions_raw.clone();
+            train_data.predictions = predictions.clone();
         }
 
-        Ok(prediction.remove_axis(Axis(0)))
+        let last_prediction = predictions
+            .outer_iter()
+            .last()
+            .ok_or_else(|| "Could not get last prediction")?;
+
+        Ok(last_prediction.to_owned())
     }
 
     pub fn naive_bwd(
         &mut self,
         lr: f32,
         train_data: &TransformerTrainData,
-        y_gt: &Array1<f32>,
+        y_gt_onehot: &Array2<f32>,
     ) -> Result<(), ErrBox> {
-        let z = &train_data.pred_raw;
-        let p = &train_data.prediction;
-        let loss = -(y_gt * p.log10()).sum();
+        let z = &train_data.predictions_raw;
+        let p = &train_data.predictions;
+        let loss = -(y_gt_onehot * p.log10()).sum();
 
-        // dbg!(&loss);
+        let grad_l_z = p - y_gt_onehot;
 
-        let grad_l_z = p - y_gt;
-
-        // dbg!(&grad_l_z);
-
-        let grad_l_unembed = train_data.last_refined_embedding.t().dot(&grad_l_z);
-
-        // dbg!(&grad_l_unembed);
+        let grad_l_unembed = train_data.x_refined.t().dot(&grad_l_z);
 
         let grad_l_h = grad_l_z.dot(&self.unembed.t());
-
-        dbg!(train_data.tb_train_data.len());
 
         let tb_iter = self
             .blocks
@@ -241,7 +232,9 @@ pub struct TBTrainData {
     x_vs: Array3<f32>,
     /// Xq @ Xk per attention head
     xqxk: Array3<f32>,
-    /// XqXk @ Xv, all attention heads
+    /// softmax(xqxk / sqrt(head_size))
+    xqxk_act: Array3<f32>,
+    /// XqXk_act @ Xv, all attention heads
     atn_scores_reshaped: Array2<f32>,
     /// atn_scores_reshaped @ atn_out
     atn_scores_atn_out: Array2<f32>,
@@ -347,13 +340,15 @@ impl TransformerBlock {
                 x_vs_slice.assign(&x.dot(&v_slice));
             });
 
-        // softmax(mask(Q @ K)) / sqrt(head_size)
+        // softmax(mask(Q @ K) / sqrt(head_size))
         let mut xqxk: Array3<f32> = Array3::zeros((self.num_heads, x_shp[0].len, x_shp[0].len));
+	let mut xqxk_act: Array3<f32> = Array3::zeros(xqxk.dim());
 
         Zip::from(xqxk.outer_iter_mut())
+            .and(xqxk_act.outer_iter_mut())
             .and(x_qs.outer_iter())
             .and(x_ks.outer_iter())
-            .par_for_each(|mut xqxk_slice, x_qs_slice, x_ks_slice| {
+            .par_for_each(|mut xqxk_slice, mut xqxk_act_slice, x_qs_slice, x_ks_slice| {
                 let mut matmul_prod = x_qs_slice.dot(&x_ks_slice.t());
 
                 // Mask off future tokens
@@ -365,21 +360,23 @@ impl TransformerBlock {
                         }
                     });
 
+		xqxk_slice.assign(&matmul_prod);
+
                 // Softmax
                 let normalized =
-                    softmax_axis(&matmul_prod, Axis(0)) / (self.head_size as f32).sqrt();
+                    softmax_axis(&(matmul_prod / (self.head_size as f32).sqrt()), Axis(0));
 
-                xqxk_slice.assign(&normalized);
+                xqxk_act_slice.assign(&normalized);
             });
 
         let mut atn_scores: Array3<f32> =
             Array3::zeros((self.num_heads, x_shp[0].len, self.head_size));
 
         Zip::from(atn_scores.outer_iter_mut())
-            .and(xqxk.outer_iter())
+            .and(xqxk_act.outer_iter())
             .and(x_vs.outer_iter())
-            .par_for_each(|mut atn_out_slice, xqxk_slice, x_vs_slice| {
-                atn_out_slice.assign(&xqxk_slice.dot(&x_vs_slice));
+            .par_for_each(|mut atn_out_slice, xqxk_act_slice, x_vs_slice| {
+                atn_out_slice.assign(&xqxk_act_slice.dot(&x_vs_slice));
             });
 
         // (num_heads, T, head_size) -> (T, C)
@@ -444,6 +441,7 @@ impl TransformerBlock {
                 x_ks,
                 x_vs,
                 xqxk,
+		xqxk_act,
                 atn_scores_reshaped,
                 atn_scores_atn_out,
                 x_with_atn_out,
@@ -469,75 +467,32 @@ impl TransformerBlock {
         // a.k.a. dL/dx_with_ff
         let grad_l_hffn = grad_l_block_out;
 
-        // Final token's ff1 activated output (from chain rule: d(a*b) / d_b = a, d(a*b) / d_a = b)
-        let last_x_ff1_act = train_data
-            .x_ff1_act
-            .axis_iter(Axis(0))
-            .next_back()
-            .ok_or_else(|| "Could not get last element of x_ff1_act")?
-            .to_owned()
-            .insert_axis(Axis(0));
-
-        let grad_l_ff2 = last_x_ff1_act.t().dot(&grad_l_hffn);
+        let grad_l_ff2 = train_data.x_ff1_act.t().dot(&grad_l_hffn);
 
         let grad_l_ff2_b = grad_l_hffn.clone();
 
-        dbg!(&grad_l_ff2);
-
         let grad_l_ff1_act = grad_l_hffn.dot(&self.ff2.t());
 
-        dbg!(&grad_l_ff1_act);
-
-        let last_x_ff1_b = train_data
-            .x_ff1_b
-            .axis_iter(Axis(0))
-            .next_back()
-            .ok_or_else(|| "Could not get last element of x_ff1_b")?
-            .to_owned()
-            .insert_axis(Axis(0));
-
         // aka dL/dx_ff1_b
-        let grad_l_hprime = grad_l_ff1_act * approx_gelu_grad(&last_x_ff1_b);
+        let grad_l_hprime = grad_l_ff1_act * approx_gelu_grad(&train_data.x_ff1_b);
 
-        let last_x_with_atn_out = train_data
-            .x_with_atn_out
-            .axis_iter(Axis(0))
-            .next_back()
-            .ok_or_else(|| "Could not get last element of x_with_atn_out")?
-            .to_owned()
-            .insert_axis(Axis(0));
-
-        let grad_l_ff1 = last_x_with_atn_out.t().dot(&grad_l_hprime);
-
-        dbg!(&grad_l_ff1);
+        let grad_l_ff1 = train_data.x_with_atn_out.t().dot(&grad_l_hprime);
 
         let grad_l_ff1_b = grad_l_hprime.clone();
-
-        dbg!(&grad_l_ff1_b);
 
         // aka dL/dx_with_atn_out
         let grad_l_hatn = grad_l_hprime.dot(&self.ff1.t());
 
-        dbg!(&grad_l_hatn);
-
         // FINAL atn_out MATRIX
 
-        let last_atn_score = train_data
-            .atn_scores_reshaped
-            .axis_iter(Axis(0))
-            .next_back()
-            .ok_or_else(|| "Could not get last element of atn_scores_atn_out")?
-            .to_owned()
-            .insert_axis(Axis(0));
-
-        let grad_l_atn_out = last_atn_score.t().dot(&grad_l_hatn);
-
-        dbg!(&grad_l_atn_out);
+        let grad_l_atn_out =train_data.atn_scores_reshaped.t().dot(&grad_l_hatn);
 
         // aka dL/datn_scores_atn_out
         let grad_l_o = grad_l_hatn.dot(&self.atn_out.t());
 
         let grad_l_o_shp: Vec<_> = grad_l_o.axes().collect();
+
+        // MULTI-HEAD ATTENTION
 
         // Split for individual heads, i.e. (T, C) -> (num_heads, T, head_size)
         let mut grad_l_o_reshaped: Array3<f32> =
@@ -557,8 +512,37 @@ impl TransformerBlock {
             });
 
         // aka dL/dxqxk
-        let mut grad_l_a: Array3<f32> = Array3::zeros(train_data.xqxk.dim());
+        let mut grad_l_a: Array3<f32> = Array3::zeros(train_data.xqxk_act.dim());
         let mut grad_l_xvs: Array3<f32> = Array3::zeros(train_data.x_vs.dim());
+
+	let mut grad_l_xqxv: Array3<f32> = Array3::zeros(train_data.xqxk.dim());
+
+        dbg!(grad_l_a.dim());
+        dbg!(grad_l_xvs.dim());
+        dbg!(grad_l_o_reshaped.dim());
+        dbg!(train_data.x_vs.dim());
+        dbg!(train_data.xqxk.dim());
+
+        Zip::from(grad_l_a.outer_iter_mut())
+            .and(grad_l_xvs.outer_iter_mut())
+            .and(grad_l_o_reshaped.outer_iter())
+            .and(train_data.x_vs.outer_iter())
+            .and(train_data.xqxk_act.outer_iter())
+            .for_each(
+                |mut grad_l_a_slice,
+                 mut grad_l_xvs_slice,
+                 grad_l_o_slice,
+                 x_vs_slice,
+                 xqxk_act_slice| {
+                    let new_grad_l_a_slice = grad_l_o_slice.dot(&x_vs_slice.t());
+                    grad_l_a_slice.assign(&new_grad_l_a_slice);
+
+                    let new_grad_l_xvs_slice = xqxk_act_slice.dot(&grad_l_o_slice);
+                    grad_l_xvs_slice.assign(&new_grad_l_xvs_slice);
+
+                },
+            );
+
 
         Ok(grad_l_hffn)
     }
@@ -605,13 +589,29 @@ mod tests {
 
         let mut train_data = TransformerTrainData::default();
 
-        let pred = t.naive_fwd(vec![1, 2, 3, 4, 5].as_slice(), Some(&mut train_data))?;
+        let x = vec![1, 2, 3, 4, 5];
 
-        // one-hot for token number 6
-        let mut expected = Array1::zeros(vocab_size);
-        expected[5] = 1.0;
+        let _pred = t.naive_fwd(x.as_slice(), Some(&mut train_data))?;
 
-        t.naive_bwd(0.001, &train_data, &expected)?;
+        // Reuse X as Y_gt for training on the tokens leading up to the next token prediction
+        let mut y_gt = x;
+
+        // Final token desired prediction
+        let expected = 6;
+
+	let _ = y_gt.pop();
+
+        y_gt.push(expected);
+
+        let mut y_gt_onehot: Array2<f32> = Array2::zeros((y_gt.len(), vocab_size));
+
+        Zip::from(y_gt_onehot.outer_iter_mut())
+            .and(&y_gt)
+            .par_for_each(|mut y_gt_onehot_row, y_gt_value| {
+                y_gt_onehot_row[*y_gt_value as usize] = 1.0;
+            });
+
+        t.naive_bwd(0.001, &train_data, &y_gt_onehot)?;
 
         Ok(())
     }
