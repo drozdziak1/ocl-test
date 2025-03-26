@@ -1,4 +1,9 @@
-use std::{iter::repeat, thread, time::Duration};
+use std::{
+    iter::repeat,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use crate::util::ErrBox;
 use ndarray::{
@@ -224,6 +229,8 @@ pub struct TransformerBlock {
 /// Intermediate state of X as it goes through the TransformerBlock; used for training
 #[derive(Clone, Default)]
 pub struct TBTrainData {
+    /// X
+    xs: Array2<f32>,
     /// X @ Q per attention head
     x_qs: Array3<f32>,
     /// X @ K per attention head
@@ -307,6 +314,9 @@ impl TransformerBlock {
         // (T, C)
         let x_shp: Vec<AxisDescription> = x.axes().collect();
 
+        // Save X for backprop
+        let xs = x.clone();
+
         let tril: Array2<u8> = Array2::ones((x_shp[0].len, x_shp[0].len)).tril(0);
 
         // ATTENTION
@@ -342,32 +352,34 @@ impl TransformerBlock {
 
         // softmax(mask(Q @ K) / sqrt(head_size))
         let mut xqxk: Array3<f32> = Array3::zeros((self.num_heads, x_shp[0].len, x_shp[0].len));
-	let mut xqxk_act: Array3<f32> = Array3::zeros(xqxk.dim());
+        let mut xqxk_act: Array3<f32> = Array3::zeros(xqxk.dim());
 
         Zip::from(xqxk.outer_iter_mut())
             .and(xqxk_act.outer_iter_mut())
             .and(x_qs.outer_iter())
             .and(x_ks.outer_iter())
-            .par_for_each(|mut xqxk_slice, mut xqxk_act_slice, x_qs_slice, x_ks_slice| {
-                let mut matmul_prod = x_qs_slice.dot(&x_ks_slice.t());
+            .par_for_each(
+                |mut xqxk_slice, mut xqxk_act_slice, x_qs_slice, x_ks_slice| {
+                    let mut matmul_prod = x_qs_slice.dot(&x_ks_slice.t());
 
-                // Mask off future tokens
-                Zip::from(&mut matmul_prod)
-                    .and(&tril)
-                    .par_for_each(|prod_elem, tril_elem| {
-                        if *tril_elem == 0 {
-                            *prod_elem = f32::NEG_INFINITY;
-                        }
-                    });
+                    // Mask off future tokens
+                    Zip::from(&mut matmul_prod)
+                        .and(&tril)
+                        .par_for_each(|prod_elem, tril_elem| {
+                            if *tril_elem == 0 {
+                                *prod_elem = f32::NEG_INFINITY;
+                            }
+                        });
 
-		xqxk_slice.assign(&matmul_prod);
+                    xqxk_slice.assign(&matmul_prod);
 
-                // Softmax
-                let normalized =
-                    softmax_axis(&(matmul_prod / (self.head_size as f32).sqrt()), Axis(0));
+                    // Softmax
+                    let normalized =
+                        softmax_axis(&(matmul_prod / (self.head_size as f32).sqrt()), Axis(0));
 
-                xqxk_act_slice.assign(&normalized);
-            });
+                    xqxk_act_slice.assign(&normalized);
+                },
+            );
 
         let mut atn_scores: Array3<f32> =
             Array3::zeros((self.num_heads, x_shp[0].len, self.head_size));
@@ -437,11 +449,12 @@ impl TransformerBlock {
 
         if let Some(train_data) = train_data {
             *train_data = TBTrainData {
+                xs,
                 x_qs,
                 x_ks,
                 x_vs,
                 xqxk,
-		xqxk_act,
+                xqxk_act,
                 atn_scores_reshaped,
                 atn_scores_atn_out,
                 x_with_atn_out,
@@ -485,7 +498,7 @@ impl TransformerBlock {
 
         // FINAL atn_out MATRIX
 
-        let grad_l_atn_out =train_data.atn_scores_reshaped.t().dot(&grad_l_hatn);
+        let grad_l_atn_out = train_data.atn_scores_reshaped.t().dot(&grad_l_hatn);
 
         // aka dL/datn_scores_atn_out
         let grad_l_o = grad_l_hatn.dot(&self.atn_out.t());
@@ -511,40 +524,124 @@ impl TransformerBlock {
                 reshaped_row.assign(&new_row);
             });
 
-        // aka dL/dxqxk
+        // aka dL/d(softmax(xqxk) / sqrt(head_size))
         let mut grad_l_a: Array3<f32> = Array3::zeros(train_data.xqxk_act.dim());
-        let mut grad_l_xvs: Array3<f32> = Array3::zeros(train_data.x_vs.dim());
+        let mut grad_l_x_vs: Array3<f32> = Array3::zeros(train_data.x_vs.dim());
 
-	let mut grad_l_xqxv: Array3<f32> = Array3::zeros(train_data.xqxk.dim());
-
-        dbg!(grad_l_a.dim());
-        dbg!(grad_l_xvs.dim());
-        dbg!(grad_l_o_reshaped.dim());
-        dbg!(train_data.x_vs.dim());
-        dbg!(train_data.xqxk.dim());
+        let mut grad_l_xqxk: Array3<f32> = Array3::zeros(train_data.xqxk.dim());
 
         Zip::from(grad_l_a.outer_iter_mut())
-            .and(grad_l_xvs.outer_iter_mut())
+            .and(grad_l_x_vs.outer_iter_mut())
+            .and(grad_l_xqxk.outer_iter_mut())
             .and(grad_l_o_reshaped.outer_iter())
             .and(train_data.x_vs.outer_iter())
             .and(train_data.xqxk_act.outer_iter())
-            .for_each(
+            .par_for_each(
                 |mut grad_l_a_slice,
-                 mut grad_l_xvs_slice,
+                 mut grad_l_x_vs_slice,
+                 mut grad_l_xqxk_slice,
                  grad_l_o_slice,
                  x_vs_slice,
                  xqxk_act_slice| {
                     let new_grad_l_a_slice = grad_l_o_slice.dot(&x_vs_slice.t());
                     grad_l_a_slice.assign(&new_grad_l_a_slice);
 
-                    let new_grad_l_xvs_slice = xqxk_act_slice.dot(&grad_l_o_slice);
-                    grad_l_xvs_slice.assign(&new_grad_l_xvs_slice);
+                    let new_grad_l_x_vs_slice = xqxk_act_slice.dot(&grad_l_o_slice);
+                    grad_l_x_vs_slice.assign(&new_grad_l_x_vs_slice);
 
+                    let new_grad_l_xqxk_slice = xqxk_act_slice.to_owned()
+                        * (&new_grad_l_a_slice
+                            - xqxk_act_slice
+                                .t()
+                                .dot(&new_grad_l_a_slice)
+                                .dot(&xqxk_act_slice));
+
+                    grad_l_xqxk_slice.assign(&new_grad_l_xqxk_slice);
                 },
             );
 
+        let mut grad_l_x_qs: Array3<f32> = Array3::zeros(train_data.x_qs.dim());
+        let mut grad_l_x_ks: Array3<f32> = Array3::zeros(train_data.x_ks.dim());
 
-        Ok(grad_l_hffn)
+        Zip::from(grad_l_x_qs.outer_iter_mut())
+            .and(grad_l_x_ks.outer_iter_mut())
+            .and(grad_l_xqxk.outer_iter())
+            .and(train_data.x_qs.outer_iter())
+            .and(train_data.x_ks.outer_iter())
+            .par_for_each(
+                |mut grad_l_x_qs_slice,
+                 mut grad_l_x_ks_slice,
+                 grad_l_xqxk_slice,
+                 x_qs_slice,
+                 x_ks_slice| {
+                    let new_grad_l_x_qs_slice = grad_l_xqxk_slice.dot(&x_ks_slice);
+                    grad_l_x_qs_slice.assign(&new_grad_l_x_qs_slice);
+
+                    let new_grad_l_x_ks_slice = grad_l_xqxk_slice.t().dot(&x_qs_slice);
+                    grad_l_x_ks_slice.assign(&new_grad_l_x_ks_slice);
+                },
+            );
+
+        let mut grad_l_query: Array3<f32> = Array3::zeros(self.query.dim());
+        let mut grad_l_key: Array3<f32> = Array3::zeros(self.key.dim());
+        let mut grad_l_value: Array3<f32> = Array3::zeros(self.query.dim());
+
+        Zip::from(grad_l_query.outer_iter_mut())
+            .and(grad_l_key.outer_iter_mut())
+            .and(grad_l_value.outer_iter_mut())
+            .and(grad_l_x_qs.outer_iter())
+            .and(grad_l_x_ks.outer_iter())
+            .and(grad_l_x_vs.outer_iter())
+            .for_each(
+                |mut grad_l_query_slice,
+                 mut grad_l_key_slice,
+                 mut grad_l_value_slice,
+                 grad_l_x_qs_slice,
+                 grad_l_x_ks_slice,
+                 grad_l_x_vs_slice| {
+                    grad_l_query_slice.assign(&train_data.xs.t().dot(&grad_l_x_qs_slice));
+                    grad_l_key_slice.assign(&train_data.xs.t().dot(&grad_l_x_ks_slice));
+                    grad_l_value_slice.assign(&train_data.xs.t().dot(&grad_l_x_vs_slice));
+                },
+            );
+
+        let xs_dim = train_data.xs.dim();
+
+        let mut grad_l_x_per_head: Array3<f32> =
+            Array3::zeros((self.num_heads, xs_dim.0, xs_dim.1));
+
+        Zip::from(grad_l_x_per_head.outer_iter_mut())
+            .and(grad_l_x_qs.outer_iter())
+            .and(self.query.outer_iter())
+            .and(grad_l_x_ks.outer_iter())
+            .and(self.key.outer_iter())
+            .par_for_each(
+                |mut x_per_head_slice,
+                 grad_l_x_qs_slice,
+                 query_slice,
+                 grad_l_x_ks_slice,
+                 key_slice| {
+                    x_per_head_slice.assign(
+                        &(&x_per_head_slice
+                            + &grad_l_x_qs_slice.dot(&query_slice.t())
+                            + &grad_l_x_ks_slice.dot(&key_slice.t())),
+                    );
+                },
+            );
+
+	// Zip takes up to 6 arguments, there would be 7 if we added all of Q, K and V, so we do V separately
+        Zip::from(grad_l_x_per_head.outer_iter_mut())
+            .and(grad_l_x_vs.outer_iter())
+            .and(self.value.outer_iter())
+            .par_for_each(|mut x_per_head_slice, grad_l_x_vs_slice, value_slice| {
+                x_per_head_slice
+                    .assign(&(&x_per_head_slice + &grad_l_x_vs_slice.dot(&value_slice.t())));
+            });
+
+	// Sum across heads
+	let grad_l_x = grad_l_x_per_head.sum_axis(Axis(0));
+
+        Ok(grad_l_x)
     }
 }
 
@@ -599,7 +696,7 @@ mod tests {
         // Final token desired prediction
         let expected = 6;
 
-	let _ = y_gt.pop();
+        let _ = y_gt.pop();
 
         y_gt.push(expected);
 
