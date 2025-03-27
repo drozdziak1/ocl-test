@@ -74,13 +74,14 @@ fn approx_gelu_grad<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
 
 pub struct Transformer {
     embed_dim: usize,
-    unembed: Array2<f32>,
     embed: Array2<f32>,
+    unembed: Array2<f32>,
     blocks: Vec<TransformerBlock>,
 }
 
 #[derive(Default)]
 pub struct TransformerTrainData {
+    x: Vec<u32>,
     /// X @ embed
     x_embedded: Array2<f32>,
     /// Train data for each attention head
@@ -164,6 +165,7 @@ impl Transformer {
         let predictions = softmax_axis(&predictions_raw, Axis(0));
 
         if let Some(train_data) = train_data {
+            train_data.x = x.to_owned();
             train_data.x_embedded = x_embedded;
             train_data.tb_train_data = tb_train_data;
             train_data.x_refined = x_refined;
@@ -203,10 +205,23 @@ impl Transformer {
 
         let mut grad_block_output = grad_l_h;
         for (tb, tb_train_data) in tb_iter {
-            grad_block_output = tb.naive_bwd(tb_train_data, grad_block_output)?;
+            grad_block_output = tb.naive_bwd(lr, tb_train_data, grad_block_output)?;
         }
 
-        panic!("kupak");
+        let grad_l_x_embedded = grad_block_output;
+
+        let mut grad_l_embed: Array2<f32> = Array2::zeros(self.embed.dim());
+
+        for (grad_l_x_embedded_slice, tok_id) in
+            grad_l_x_embedded.outer_iter().zip(train_data.x.iter())
+        {
+            let mut grad_l_embed_slice = grad_l_embed.index_axis_mut(Axis(0), *tok_id as usize);
+
+            grad_l_embed_slice.assign(&(&grad_l_embed_slice + &grad_l_x_embedded_slice));
+        }
+
+        self.unembed = &self.unembed - grad_l_unembed * lr;
+        self.embed = &self.embed - grad_l_embed * lr;
 
         Ok(())
     }
@@ -472,6 +487,7 @@ impl TransformerBlock {
 
     pub fn naive_bwd(
         &mut self,
+        lr: f32,
         train_data: &TBTrainData,
         grad_l_block_out: Array2<f32>,
     ) -> Result<Array2<f32>, ErrBox> {
@@ -592,7 +608,7 @@ impl TransformerBlock {
             .and(grad_l_x_qs.outer_iter())
             .and(grad_l_x_ks.outer_iter())
             .and(grad_l_x_vs.outer_iter())
-            .for_each(
+            .par_for_each(
                 |mut grad_l_query_slice,
                  mut grad_l_key_slice,
                  mut grad_l_value_slice,
@@ -629,7 +645,7 @@ impl TransformerBlock {
                 },
             );
 
-	// Zip takes up to 6 arguments, there would be 7 if we added all of Q, K and V, so we do V separately
+        // Zip takes up to 6 arguments, there would be 7 if we added all of Q, K and V, so we do V separately
         Zip::from(grad_l_x_per_head.outer_iter_mut())
             .and(grad_l_x_vs.outer_iter())
             .and(self.value.outer_iter())
@@ -638,8 +654,21 @@ impl TransformerBlock {
                     .assign(&(&x_per_head_slice + &grad_l_x_vs_slice.dot(&value_slice.t())));
             });
 
-	// Sum across heads
-	let grad_l_x = grad_l_x_per_head.sum_axis(Axis(0));
+        // Sum across heads
+        let grad_l_x = grad_l_x_per_head.sum_axis(Axis(0));
+
+        // APPLY GRADIENTS
+        self.ff2_b = &self.ff2_b - grad_l_ff2_b * lr;
+        self.ff2 = &self.ff2 - grad_l_ff2 * lr;
+
+        self.ff1_b = &self.ff1_b - grad_l_ff1_b * lr;
+        self.ff1 = &self.ff1 - grad_l_ff1 * lr;
+
+        self.atn_out = &self.atn_out - grad_l_atn_out * lr;
+
+        self.query = &self.query - grad_l_query * lr;
+        self.key = &self.key - grad_l_key * lr;
+        self.value = &self.value - grad_l_value * lr;
 
         Ok(grad_l_x)
     }
@@ -671,45 +700,62 @@ mod tests {
         Ok(())
     }
 
+    /// Does this thing even learn?
     #[test]
-    fn test_transformer_naive_fwd_happy_path() -> Result<(), ErrBox> {
+    fn test_transformer_happy_path() -> Result<(), ErrBox> {
         let ctx_size = 32_000;
         let vocab_size = 15;
         let embed_dim = 32;
         let num_layers = 32;
         let num_heads = 16;
         let ff_dim = 18;
+	let lr = 0.01;
 
         let mut t = Transformer::new(
             ctx_size, vocab_size, embed_dim, num_layers, num_heads, ff_dim,
         )?;
 
-        let mut train_data = TransformerTrainData::default();
+	let n_iter = 100;
 
-        let x = vec![1, 2, 3, 4, 5];
+        for _i in 0..n_iter {
+            let mut train_data = TransformerTrainData::default();
 
-        let _pred = t.naive_fwd(x.as_slice(), Some(&mut train_data))?;
+            let x = vec![1, 2, 3, 4, 5];
 
-        // Reuse X as Y_gt for training on the tokens leading up to the next token prediction
-        let mut y_gt = x;
+            let pred = t.naive_fwd(x.as_slice(), Some(&mut train_data))?;
 
-        // Final token desired prediction
-        let expected = 6;
-
-        let _ = y_gt.pop();
-
-        y_gt.push(expected);
-
-        let mut y_gt_onehot: Array2<f32> = Array2::zeros((y_gt.len(), vocab_size));
-
-        Zip::from(y_gt_onehot.outer_iter_mut())
-            .and(&y_gt)
-            .par_for_each(|mut y_gt_onehot_row, y_gt_value| {
-                y_gt_onehot_row[*y_gt_value as usize] = 1.0;
+            let pred_tok_id = pred.indexed_iter().fold((0, 0.0), |cur_max, (idx, val)| {
+                if *val > cur_max.1 {
+                    (idx, *val)
+                } else {
+                    cur_max
+                }
             });
 
-        t.naive_bwd(0.001, &train_data, &y_gt_onehot)?;
+            // Reuse X as Y_gt for training on the tokens leading up to the next token prediction
+            let mut y_gt = x;
 
-        Ok(())
+            // Final token desired prediction
+            let expected = 9u32;
+
+            if pred_tok_id.0 == expected as usize {
+                return Ok(());
+            }
+
+            y_gt.push(expected);
+            y_gt = (&y_gt[1..]).to_owned();
+
+            let mut y_gt_onehot: Array2<f32> = Array2::zeros((y_gt.len(), vocab_size));
+
+            Zip::from(y_gt_onehot.outer_iter_mut())
+                .and(&y_gt)
+                .par_for_each(|mut y_gt_onehot_row, y_gt_value| {
+                    y_gt_onehot_row[*y_gt_value as usize] = 1.0;
+                });
+
+            t.naive_bwd(lr, &train_data, &y_gt_onehot)?;
+        }
+
+        Err(format!("Transformer would not predict 1 2 3 4 5 9 after {} iterations", n_iter).into())
     }
 }
