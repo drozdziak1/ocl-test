@@ -1,17 +1,11 @@
-use std::{
-    iter::repeat,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
 
 use crate::util::ErrBox;
 use ndarray::{
-    Array, Array1, Array2, Array3, ArrayBase, Axis, AxisDescription, Dimension, Order, Zip,
+    Array, Array1, Array2, Array3, Axis, AxisDescription, Dimension, Order, Zip,
 };
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::ParallelIterator;
 
 /// Computes the range for tensor randomization. Randomization is
 /// uniform in range (-l, l) where l = 1/sqrt(product(dim0, dim1, ...))
@@ -132,7 +126,7 @@ impl Transformer {
     pub fn naive_fwd(
         &self,
         x: &[u32],
-        mut train_data: Option<&mut TransformerTrainData>,
+        train_data: Option<&mut TransformerTrainData>,
     ) -> Result<Array1<f32>, ErrBox> {
         let mut x_embedded: Array2<f32> = Array2::zeros((x.len(), self.embed_dim));
 
