@@ -18,7 +18,7 @@ use std::{
 };
 
 use nseq_tokenizer::NSeqTokenizer;
-use util::ErrBox;
+use util::{ErrBox, init_log};
 
 pub const NSEQ_SIZE: usize = 2;
 
@@ -169,14 +169,4 @@ fn main() -> Result<(), ErrBox> {
     serde_json::to_writer_pretty(&f, &export)?;
 
     Ok(())
-}
-
-/// Init logging at info level by default
-fn init_log() {
-    match env::var("RUST_LOG") {
-        Ok(_value) => env_logger::init(),
-        Err(_e) => env_logger::Builder::new()
-            .filter_level(LevelFilter::Info)
-            .init(),
-    }
 }

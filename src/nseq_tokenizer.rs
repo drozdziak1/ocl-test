@@ -155,7 +155,7 @@ pub struct NSeqTokenizer<const N: usize = 2> {
     /// unroll to the same string during training
     pub tokens_unrolled: Arc<RwLock<HashSet<String>>>,
     pub vocab_size: u32,
-    next_free_id: Arc<RwLock<u32>>,
+    pub next_free_id: Arc<RwLock<u32>>,
 }
 
 impl<const N: usize> NSeqTokenizer<N> {
