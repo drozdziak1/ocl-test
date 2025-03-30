@@ -7,13 +7,15 @@ edition = "2021"
 clap = { version = "4.5.31", features = ["derive"] }
 dialoguer = "0.11.0"
 env_logger = "0.11.6"
+fastapprox = "0.3.1"
 indicatif = {version = "0.17.11", features = ["rayon"]}
 lazy_static = "1.5.0"
 log = "0.4.26"
 ndarray = {version = "0.16.1", features = ["rayon"]}
 ndarray-rand = "0.15.0"
 ocl = "0.19.7"
-polars = {version = "0.46.0", features = ["lazy", "parquet"]}
+polars = {version = "0.46.0", features = ["lazy", "parquet", "random"]}
+rand = "0.8.5"
 rayon = "1.10.0"
 regex = "1.11.1"
 serde = { version = "1.0.218", features = ["derive"] }
@@ -26,3 +28,6 @@ path = "src/train_nseq_tokenizer.rs"
 [[bin]]
 name = "train-llm"
 path = "src/train_llm.rs"
+
+[profile.release]
+debug = true # for flamegraph
