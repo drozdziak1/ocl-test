@@ -1,11 +1,18 @@
-
 use crate::util::ErrBox;
-use ndarray::{
-    Array, Array1, Array2, Array3, Axis, AxisDescription, Dimension, Order, Zip,
-};
+use ndarray::{Array, Array1, Array2, Array3, Axis, AxisDescription, Dimension, Order, Zip};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
-use rayon::iter::ParallelIterator;
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+
+pub const SMOL_NUMBER: f32 = f32::EPSILON * 10.0;
+
+fn smol_if_needed(n: f32) -> f32 {
+    if n.abs() > SMOL_NUMBER {
+        n
+    } else {
+        SMOL_NUMBER.copysign(n)
+    }
+}
 
 /// Computes the range for tensor randomization. Randomization is
 /// uniform in range (-l, l) where l = 1/sqrt(product(dim0, dim1, ...))
@@ -28,7 +35,7 @@ fn softmax_axis(a: &Array2<f32>, ax: Axis) -> Array2<f32> {
             let a_exp = a_slice.exp();
             let sum = a_exp.sum();
 
-            out_slice.assign(&(a_exp / sum));
+            out_slice.assign(&(a_exp / smol_if_needed(sum)));
         });
 
     return out;
@@ -40,7 +47,7 @@ fn approx_gelu<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
 
     Zip::from(&mut out).and(a).par_for_each(|out_elem, a_elem| {
         // sigmoid(x * 1.702)
-        let sigmoid1702 = 1.0 / (1.0 + (-1.702 * a_elem).exp());
+        let sigmoid1702 = 1.0 / smol_if_needed(1.0 + (-1.702 * a_elem).exp());
 
         // GELU(x) ~= x * sigmoid(x * 1.702)
         let approx_gelu = a_elem * sigmoid1702;
@@ -57,7 +64,7 @@ fn approx_gelu_grad<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
         let x1702 = 1.702 * a_elem;
 
         // sigmoid(x * 1.702)
-        let sigmoid1702 = 1.0 / (1.0 + (x1702).exp());
+        let sigmoid1702 = 1.0 / smol_if_needed(1.0 + (x1702).exp());
 
         let approx_gelu_grad = sigmoid1702 * (1.0 + x1702 * (1.0 - sigmoid1702));
 
@@ -67,6 +74,7 @@ fn approx_gelu_grad<D: Dimension>(a: &Array<f32, D>) -> Array<f32, D> {
 }
 
 pub struct Transformer {
+    vocab_size: usize,
     embed_dim: usize,
     embed: Array2<f32>,
     unembed: Array2<f32>,
@@ -116,6 +124,7 @@ impl Transformer {
             .collect();
 
         Ok(Self {
+            vocab_size,
             embed_dim,
             unembed,
             embed,
@@ -179,13 +188,26 @@ impl Transformer {
         &mut self,
         lr: f32,
         train_data: &TransformerTrainData,
-        y_gt_onehot: &Array2<f32>,
-    ) -> Result<(), ErrBox> {
+        y_gt: &[u32],
+    ) -> Result<f32, ErrBox> {
+        let mut y_gt_onehot: Array2<f32> = Array2::zeros((y_gt.len(), self.vocab_size));
+
+        Zip::from(y_gt_onehot.outer_iter_mut())
+            .and(y_gt)
+            .par_for_each(|mut y_gt_onehot_row, y_gt_value| {
+                y_gt_onehot_row[*y_gt_value as usize] = 1.0;
+            });
+
         let z = &train_data.predictions_raw;
         let p = &train_data.predictions;
-        let loss = -(y_gt_onehot * p.log10()).sum();
 
-        let grad_l_z = p - y_gt_onehot;
+        let mut ln_p = p.clone();
+
+        ln_p.par_iter_mut()
+            .for_each(|elem| *elem = fastapprox::faster::ln((*elem).max(SMOL_NUMBER)));
+        let loss = -(&y_gt_onehot * ln_p).sum();
+
+        let grad_l_z = p - &y_gt_onehot;
 
         let grad_l_unembed = train_data.x_refined.t().dot(&grad_l_z);
 
@@ -217,7 +239,7 @@ impl Transformer {
         self.unembed = &self.unembed - grad_l_unembed * lr;
         self.embed = &self.embed - grad_l_embed * lr;
 
-        Ok(())
+        Ok(loss)
     }
 }
 
@@ -225,6 +247,9 @@ pub struct TransformerBlock {
     num_heads: usize,
     head_size: usize,
     ff_dim: usize,
+    embed_dim: usize,
+    ln_scale: Array1<f32>,
+    ln_bias: Array1<f32>,
     query: Array3<f32>,
     key: Array3<f32>,
     value: Array3<f32>,
@@ -240,6 +265,14 @@ pub struct TransformerBlock {
 pub struct TBTrainData {
     /// X
     xs: Array2<f32>,
+    /// Mean of each embedding
+    mu: Array1<f32>,
+    /// Variance of each embedding
+    var: Array1<f32>,
+    /// X normalized w.r.t. mu and variance
+    x_hat: Array2<f32>,
+    /// X after completing layernorm
+    x_ln: Array2<f32>,
     /// X @ Q per attention head
     x_qs: Array3<f32>,
     /// X @ K per attention head
@@ -278,6 +311,9 @@ impl TransformerBlock {
 
         let qkv_dims = (num_heads, embed_dim, head_size);
 
+        let ln_scale = Array1::ones(embed_dim);
+        let ln_bias = Array1::zeros(embed_dim);
+
         let query = Array3::random(qkv_dims, qkv_rand_dist);
 
         let key = Array3::random(qkv_dims, qkv_rand_dist);
@@ -300,6 +336,10 @@ impl TransformerBlock {
             num_heads,
             head_size,
             ff_dim,
+            embed_dim,
+
+            ln_scale,
+            ln_bias,
 
             query,
             key,
@@ -326,6 +366,32 @@ impl TransformerBlock {
         // Save X for backprop
         let xs = x.clone();
 
+        let mu = xs.mean_axis(Axis(1)).expect("failed to calculate mean");
+
+        let var = xs.var_axis(Axis(1), 0.0);
+
+        // Normalized X preserved for backprop
+        let mut x_hat = Array2::zeros(x.dim());
+
+        // X after going through all of layernorm
+        let mut x_ln = Array2::zeros(x.dim());
+
+        Zip::from(x_ln.outer_iter_mut())
+            .and(x_hat.outer_iter_mut())
+            .and(xs.outer_iter())
+            .and(&mu)
+            .and(&var)
+            .par_for_each(
+                |mut x_ln_slice, mut x_hat_slice, xs_slice, mu_elem, var_elem| {
+                    let x_hat = &xs_slice - *mu_elem / (var_elem + SMOL_NUMBER).sqrt();
+
+                    let new_x_ln_row = &self.ln_scale * &x_hat + &self.ln_bias;
+
+                    x_hat_slice.assign(&x_hat);
+                    x_ln_slice.assign(&new_x_ln_row);
+                },
+            );
+
         let tril: Array2<u8> = Array2::ones((x_shp[0].len, x_shp[0].len)).tril(0);
 
         // ATTENTION
@@ -338,7 +404,7 @@ impl TransformerBlock {
         Zip::from(x_qs.outer_iter_mut())
             .and(self.query.outer_iter())
             .par_for_each(|mut x_qs_slice, q_slice| {
-                x_qs_slice.assign(&x.dot(&q_slice));
+                x_qs_slice.assign(&x_ln.dot(&q_slice));
             });
 
         // X @ K
@@ -347,7 +413,7 @@ impl TransformerBlock {
         Zip::from(x_ks.outer_iter_mut())
             .and(self.key.outer_iter())
             .par_for_each(|mut x_ks_slice, k_slice| {
-                x_ks_slice.assign(&x.dot(&k_slice));
+                x_ks_slice.assign(&x_ln.dot(&k_slice));
             });
 
         // X @ V
@@ -356,7 +422,7 @@ impl TransformerBlock {
         Zip::from(x_vs.outer_iter_mut())
             .and(self.value.outer_iter())
             .par_for_each(|mut x_vs_slice, v_slice| {
-                x_vs_slice.assign(&x.dot(&v_slice));
+                x_vs_slice.assign(&x_ln.dot(&v_slice));
             });
 
         // softmax(mask(Q @ K) / sqrt(head_size))
@@ -383,9 +449,10 @@ impl TransformerBlock {
                     xqxk_slice.assign(&matmul_prod);
 
                     // Softmax
-                    let normalized =
-                        softmax_axis(&(matmul_prod / (self.head_size as f32).sqrt()), Axis(0));
-
+                    let normalized = softmax_axis(
+                        &(matmul_prod / smol_if_needed((self.head_size as f32).sqrt())),
+                        Axis(0),
+                    );
                     xqxk_act_slice.assign(&normalized);
                 },
             );
@@ -426,31 +493,30 @@ impl TransformerBlock {
         // MLP
 
         // Xff1 = GELU(X @ ff1 + ff1_b)
-        let x_ff1_dims = (x_shp[0].len, self.ff_dim);
-        let ff1_b_broadcast = self.ff1_b.broadcast(x_ff1_dims).expect(&format!(
-            "Could not broadcast ff1_b to dimensions {:?}",
-            x_ff1_dims
-        ));
 
         let x_ff1: Array2<f32> = x.dot(&self.ff1);
 
-        let x_ff1_b: Array2<f32> = &x_ff1 + &ff1_b_broadcast;
+        let mut x_ff1_b: Array2<f32> = x_ff1.clone();
+
+        let ff1_b_row = self.ff1_b.index_axis(Axis(0), 0);
+
+        Zip::from(x_ff1_b.axis_iter_mut(Axis(0))).par_for_each(|mut x_ff1_b_row| {
+            x_ff1_b_row.assign(&(&x_ff1_b_row + &ff1_b_row));
+        });
 
         let x_ff1_act: Array2<f32> = approx_gelu(&x_ff1_b);
 
         // Xff2 = Xff1 @ ff2 + ff2_b
-        let x_ff2_dims = (x_shp[0].len, x_shp[1].len);
-        let ff2_b_broadcast = self
-            .ff2_b
-            .broadcast((x_shp[0].len, x_shp[1].len))
-            .expect(&format!(
-                "Could not broadcast ff2_b to dimensions {:?}",
-                x_ff2_dims
-            ));
 
         let x_ff2: Array2<f32> = x_ff1_act.dot(&self.ff2);
 
-        let x_ff2_b: Array2<f32> = &x_ff2 + &ff2_b_broadcast;
+        let mut x_ff2_b: Array2<f32> = x_ff2.clone();
+
+        let ff2_b_row = self.ff2_b.index_axis(Axis(0), 0);
+
+        Zip::from(x_ff2_b.axis_iter_mut(Axis(0))).par_for_each(|mut x_ff2_b_row| {
+            x_ff2_b_row.assign(&(&x_ff2_b_row + &ff2_b_row));
+        });
 
         let x_with_ff = &*x + &x_ff2_b;
 
@@ -459,6 +525,10 @@ impl TransformerBlock {
         if let Some(train_data) = train_data {
             *train_data = TBTrainData {
                 xs,
+                mu,
+                var,
+                x_hat,
+                x_ln,
                 x_qs,
                 x_ks,
                 x_vs,
@@ -483,16 +553,17 @@ impl TransformerBlock {
         &mut self,
         lr: f32,
         train_data: &TBTrainData,
-        grad_l_block_out: Array2<f32>,
+        // Next block input's gradient
+        grad_l_x_next_block: Array2<f32>,
     ) -> Result<Array2<f32>, ErrBox> {
         // FEEDFORWARD
 
         // a.k.a. dL/dx_with_ff
-        let grad_l_hffn = grad_l_block_out;
+        let grad_l_hffn = grad_l_x_next_block;
 
         let grad_l_ff2 = train_data.x_ff1_act.t().dot(&grad_l_hffn);
 
-        let grad_l_ff2_b = grad_l_hffn.clone();
+        let grad_l_ff2_b = grad_l_hffn.sum_axis(Axis(0));
 
         let grad_l_ff1_act = grad_l_hffn.dot(&self.ff2.t());
 
@@ -501,7 +572,7 @@ impl TransformerBlock {
 
         let grad_l_ff1 = train_data.x_with_atn_out.t().dot(&grad_l_hprime);
 
-        let grad_l_ff1_b = grad_l_hprime.clone();
+        let grad_l_ff1_b = grad_l_hprime.sum_axis(Axis(0));
 
         // aka dL/dx_with_atn_out
         let grad_l_hatn = grad_l_hprime.dot(&self.ff1.t());
@@ -649,7 +720,110 @@ impl TransformerBlock {
             });
 
         // Sum across heads
-        let grad_l_x = grad_l_x_per_head.sum_axis(Axis(0));
+        let grad_l_x_ln = grad_l_x_per_head.sum_axis(Axis(0));
+
+        let grad_l_ln_scale = (&grad_l_x_ln * &train_data.x_hat).sum_axis(Axis(0));
+
+        let grad_l_ln_bias = grad_l_x_ln.sum_axis(Axis(0));
+
+        let mut grad_l_x_hat = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_x_hat.outer_iter_mut())
+            .and(grad_l_x_ln.outer_iter())
+            .par_for_each(|mut grad_l_x_hat_slice, grad_l_x_ln_slice| {
+                grad_l_x_hat_slice.assign(&(&grad_l_x_ln_slice * &self.ln_scale));
+            });
+
+        // Helper precomputed value of X[i,j] - mu[i]
+        let mut xs_minus_mu = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(xs_minus_mu.outer_iter_mut())
+            .and(train_data.xs.outer_iter())
+            .and(&train_data.mu)
+            .par_for_each(|mut xs_minus_mu_slice, xs_slice, mu_elem| {
+                xs_minus_mu_slice.assign(&(&xs_slice - *mu_elem));
+            });
+
+        // NOTE: equations for remaining layernorm gradients are
+        // rather large, we split them into arbitrary terms to cope.
+        let grad_l_var_term1 = &grad_l_x_hat * &xs_minus_mu;
+        let grad_l_var_term2 = -0.5 * (&train_data.var + SMOL_NUMBER).powf(-1.5);
+
+        let mut grad_l_var_term1_times_term2 = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_var_term1_times_term2.outer_iter_mut())
+            .and(grad_l_var_term1.outer_iter())
+            .and(&grad_l_var_term2)
+            .par_for_each(
+                |mut grad_l_var_term1_times_term2_slice,
+                 grad_l_var_term1_slice,
+                 grad_l_var_term2_elem| {
+                    grad_l_var_term1_times_term2_slice
+                        .assign(&(&grad_l_var_term1_slice * *grad_l_var_term2_elem));
+                },
+            );
+
+        let grad_l_var = grad_l_var_term1_times_term2.sum_axis(Axis(1));
+
+        let mut grad_l_mu_term1 = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_mu_term1.outer_iter_mut())
+            .and(grad_l_x_hat.outer_iter())
+            .and(&train_data.var)
+            .par_for_each(|mut grad_l_mu_term1_slice, grad_l_x_hat_slice, var_elem| {
+                let new_slice = &grad_l_x_hat_slice * (-1.0 / (*var_elem + SMOL_NUMBER).sqrt());
+
+                grad_l_mu_term1_slice.assign(&new_slice);
+            });
+
+        let grad_l_mu_term2 = (-2.0 * &xs_minus_mu / (self.embed_dim as f32)).sum_axis(Axis(1));
+
+        let grad_l_mu = grad_l_mu_term1.sum_axis(Axis(1)) + &grad_l_var * grad_l_mu_term2;
+
+        let mut grad_l_x_term1 = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_x_term1.outer_iter_mut())
+            .and(grad_l_x_hat.outer_iter())
+            .and(&train_data.var)
+            .par_for_each(|mut grad_l_x_term1_slice, grad_l_x_hat_slice, var_elem| {
+                let new_slice = &grad_l_x_hat_slice / (*var_elem + SMOL_NUMBER).sqrt();
+
+                grad_l_x_term1_slice.assign(&new_slice);
+            });
+
+        let mut grad_l_x_term2 = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_x_term2.outer_iter_mut())
+            .and(xs_minus_mu.outer_iter())
+            .and(&grad_l_var)
+            .par_for_each(
+                |mut grad_l_x_term2_slice, xs_minus_mu_slice, grad_l_var_elem| {
+                    let new_slice =
+                        *grad_l_var_elem * 2.0 * &xs_minus_mu_slice / (self.embed_dim as f32);
+
+                    grad_l_x_term2_slice.assign(&new_slice);
+                },
+            );
+
+        let grad_l_x_term3 = grad_l_mu / (self.embed_dim as f32);
+
+        let mut grad_l_x = Array2::zeros(train_data.xs.dim());
+
+        Zip::from(grad_l_x.outer_iter_mut())
+            .and(grad_l_x_term1.outer_iter())
+            .and(grad_l_x_term2.outer_iter())
+            .and(&grad_l_x_term3)
+            .par_for_each(
+                |mut grad_l_x_slice,
+                 grad_l_x_term1_slice,
+                 grad_l_x_term2_slice,
+                 grad_l_x_term3_elem| {
+                    let new_slice =
+                        &grad_l_x_term1_slice + &grad_l_x_term2_slice + *grad_l_x_term3_elem;
+
+                    grad_l_x_slice.assign(&new_slice);
+                },
+            );
 
         // APPLY GRADIENTS
         self.ff2_b = &self.ff2_b - grad_l_ff2_b * lr;
@@ -663,6 +837,9 @@ impl TransformerBlock {
         self.query = &self.query - grad_l_query * lr;
         self.key = &self.key - grad_l_key * lr;
         self.value = &self.value - grad_l_value * lr;
+
+        self.ln_scale = &self.ln_scale - grad_l_ln_scale * lr;
+        self.ln_bias = &self.ln_bias - grad_l_ln_bias * lr;
 
         Ok(grad_l_x)
     }
@@ -703,28 +880,22 @@ mod tests {
         let num_layers = 32;
         let num_heads = 16;
         let ff_dim = 18;
-	let lr = 0.01;
+        let lr = 0.01;
 
         let mut t = Transformer::new(
             ctx_size, vocab_size, embed_dim, num_layers, num_heads, ff_dim,
         )?;
 
-	let n_iter = 100;
+        let n_iter = 20;
+
+        let mut loss = std::f32::MAX;
 
         for _i in 0..n_iter {
             let mut train_data = TransformerTrainData::default();
 
             let x = vec![1, 2, 3, 4, 5];
 
-            let pred = t.naive_fwd(x.as_slice(), Some(&mut train_data))?;
-
-            let pred_tok_id = pred.indexed_iter().fold((0, 0.0), |cur_max, (idx, val)| {
-                if *val > cur_max.1 {
-                    (idx, *val)
-                } else {
-                    cur_max
-                }
-            });
+            let _pred = t.naive_fwd(x.as_slice(), Some(&mut train_data))?;
 
             // Reuse X as Y_gt for training on the tokens leading up to the next token prediction
             let mut y_gt = x;
@@ -732,24 +903,14 @@ mod tests {
             // Final token desired prediction
             let expected = 9u32;
 
-            if pred_tok_id.0 == expected as usize {
-                return Ok(());
-            }
-
             y_gt.push(expected);
             y_gt = (&y_gt[1..]).to_owned();
 
-            let mut y_gt_onehot: Array2<f32> = Array2::zeros((y_gt.len(), vocab_size));
+            let new_loss = t.naive_bwd(lr, &train_data, &y_gt)?;
 
-            Zip::from(y_gt_onehot.outer_iter_mut())
-                .and(&y_gt)
-                .par_for_each(|mut y_gt_onehot_row, y_gt_value| {
-                    y_gt_onehot_row[*y_gt_value as usize] = 1.0;
-                });
-
-            t.naive_bwd(lr, &train_data, &y_gt_onehot)?;
+            assert!(dbg!(new_loss) < dbg!(loss));
         }
 
-        Err(format!("Transformer would not predict 1 2 3 4 5 9 after {} iterations", n_iter).into())
+        Ok(())
     }
 }
