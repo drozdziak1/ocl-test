@@ -15,6 +15,8 @@
         overlays = [ rust-overlay.overlays.default ];
       };
       common-deps = with pkgs; [
+        cargo-flamegraph
+        linuxPackages.perf
         opencl-headers
         openssl
         pkg-config
