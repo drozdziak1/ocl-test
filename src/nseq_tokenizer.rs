@@ -13,7 +13,7 @@ use std::{
 use crate::ErrBox;
 
 /// Used for differentiating UTF32 codepoints from token ids
-pub const TOK_ID_OFFSET: u32 = 2_000_000;
+pub const TOK_ID_OFFSET: u32 = 1_114_112;
 
 lazy_static! {
     static ref REGEX_ALLOWED: Regex = Regex::new(r"^( ?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+|\s+)$")
