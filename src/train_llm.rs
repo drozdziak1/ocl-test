@@ -2,25 +2,26 @@ mod nseq_tokenizer;
 mod transformer;
 mod util;
 
+use clap::Parser;
 use log::{debug, info, trace, warn};
 use ndarray_rand::rand::seq::IteratorRandom;
 use nseq_tokenizer::{NSeqTokenizer, TokenizerExport};
-use transformer::{Transformer, TransformerTrainData};
-use util::{init_log, ErrBox};
-
-use clap::Parser;
 use polars::prelude::*;
+use rand::SeedableRng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use tokenizers::tokenizer::Tokenizer;
 
 use std::{fs::File, path::PathBuf};
+
+use transformer::{Transformer, TransformerGradients, TransformerTrainData};
+use util::{init_log, ErrBox};
 
 #[derive(Parser)]
 #[command(version, about)]
 pub struct Cli {
-    /// Path to a pre-trained n-sequence tokenizer (see "train_nseq_tokenizer" for details
-    #[arg(short, long, default_value = "./tokenizer.json")]
-    tokenizer_path: PathBuf,
-
+    // /// Path to a pre-trained n-sequence tokenizer (see "train_nseq_tokenizer" for details
+    // #[arg(short, long, default_value = "./tokenizer.json")]
+    // tokenizer_path: PathBuf,
     /// Context size
     #[arg(short, long, default_value_t = 10_000)]
     ctx_width: u32,
@@ -45,13 +46,20 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 3e-5)]
     lr: f32,
 
-    /// How many samples to train on
+    /// How many samples between gradient applications
+    #[arg(short = 'B', long, default_value_t = 10)]
+    batch_size: u32,
+
+    /// How many samples to train on in total
     #[arg(short, long, default_value_t = 1_000_000)]
     n_samples: u32,
 
     /// Up to how many tokens to use for each forward pass
     #[arg(short, long, default_value_t = 1_000)]
     sample_size: u32,
+
+    #[arg(short, long, default_value_t = 0xdeadbeef)]
+    rng_seed: u64,
 
     /// Path to fineweb parquet file
     #[arg(
@@ -71,48 +79,74 @@ fn main() -> Result<(), ErrBox> {
 
     let cli = Cli::parse();
 
-    let tokenizer_file = File::open(cli.tokenizer_path)?;
+    let tokenizer =
+        Tokenizer::from_pretrained("bert-base-cased", None).expect("Could not load tokenizer");
 
-    let tokenizer_export: TokenizerExport = serde_json::from_reader(tokenizer_file)?;
-
-    let tokenizer = NSeqTokenizer::<2>::import(&tokenizer_export)?;
-
-    let vocab_size = tokenizer
-        .next_free_id
-        .read()
-        .expect("Could not lock tokenizer next_free_id")
-        .clone() as usize;
-
-    let mut t = Transformer::new(
-        cli.ctx_width as usize,
-        vocab_size,
-        cli.embed_dim as usize,
-        cli.block_count as usize,
-        cli.head_count as usize,
-        cli.ff_dim as usize,
-    )?;
+    let vocab_size = tokenizer.get_vocab_size(true);
+    let sample_size = cli.sample_size as usize;
+    let batch_size = cli.batch_size as usize;
 
     let df = LazyFrame::scan_parquet(cli.fineweb_path, Default::default())?
         .select([col("text")])
         .collect()?;
 
-    let mut rng = rand::thread_rng();
+    let col = df.column("text")?.str()?;
 
-    let mut texts_iter = df.column("text")?.str()?.iter().enumerate();
+    let val_samples_size = if batch_size / 10 > 0 {
+        batch_size / 10
+    } else {
+        1
+    };
 
-    let sample_size = cli.sample_size as usize;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(cli.rng_seed);
+
+    let col_sampled = col
+        .sample_n(val_samples_size, false, false, Some(cli.rng_seed))
+        .expect("Could not sample text column");
+
+    let validation_samples: Vec<Vec<u32>> = (0..val_samples_size)
+        .map(|offset| -> Result<Vec<u32>, ErrBox> {
+            let txt = col_sampled
+                .get(offset)
+                .ok_or_else(|| "Could not get record for validation sample")?;
+
+            let encoding = tokenizer
+                .encode(txt, false)
+                .expect("Could not encode validation txt");
+
+            let sample = encoding
+                .get_ids()
+                .get(0..sample_size)
+                .expect("Could not slice sample_size tokens from validation_encoding")
+                .to_owned();
+
+            Ok(sample)
+        })
+        .collect::<Result<Vec<Vec<u32>>, ErrBox>>()?;
+
+    let mut texts_iter = col.iter().enumerate();
 
     let mut i = 0;
 
     // used for averaging
     let mut losses = vec![];
 
+    // Used for batching of gradient applications
+    let mut grads_sum: Option<TransformerGradients> = None;
+
+    let mut model = Transformer::new(
+        cli.ctx_width as usize,
+        vocab_size,
+        cli.embed_dim as usize,
+        cli.block_count as usize,
+        cli.head_count as usize,
+        cli.ff_dim as usize,
+        &mut rng,
+    )?;
+
     'texts_loop: while let Some((txt_idx, Some(txt))) = texts_iter.next() {
-        let tokenized: Vec<_> = tokenizer
-            .tokenize_str(txt)
-            .par_iter()
-            .map(|comp| comp.as_u32())
-            .collect();
+        let encoding = tokenizer.encode(txt, false).expect("Could not encode");
+        let tokenized: Vec<_> = encoding.get_ids().to_owned();
 
         let tokenized_len = tokenized.len();
 
@@ -123,10 +157,6 @@ fn main() -> Result<(), ErrBox> {
             if i >= cli.n_samples {
                 break 'texts_loop;
             }
-            // let sample_len = (2..sample_size)
-            //     .choose(&mut rng)
-            //     .expect("could not choose 2..sample_size")
-            //     .min(tokenized_len);
 
             let sample_len = sample_size.min(tokenized_len);
 
@@ -140,42 +170,72 @@ fn main() -> Result<(), ErrBox> {
 
             let (_first, y_gt) = sample.split_at(1);
 
-            let mut loss = 0.0;
-            // for _ in 0..2 {
-                let mut train_data = TransformerTrainData::default();
+            let mut train_data = TransformerTrainData::default();
 
-                t.naive_fwd(x, Some(&mut train_data))?;
+            model.naive_fwd(x, Some(&mut train_data))?;
 
-                loss = t.naive_bwd(cli.lr, &train_data, y_gt)?;
+            let new_grads = model.naive_bwd(&train_data, y_gt)?;
 
-                debug!(
-		    "txt No.: {:10} | Sample No.: {:6} | idxs: {:5} - {:5} | len: {}| loss: {:.12}",
-		    txt_idx,
-		    i,
-		    start_idx,
-		    start_idx + sample_len,
-		    sample_len,
-		    loss
-		);
-            // }
+            debug!(
+                "txt No.: {:10} | Sample No.: {:6} | idxs: {:5} - {:5} | len: {}| loss: {:.12}",
+                txt_idx,
+                i,
+                start_idx,
+                start_idx + sample_len,
+                sample_len,
+                new_grads.loss,
+            );
 
-            losses.push(loss);
+            losses.push(new_grads.loss);
 
-            if i % 10 == 0 {
-                let avg = losses.iter().fold(0.0, |acc, x| acc + x) / losses.len() as f32;
-                let min = losses
+            if let Some(grads_accum) = grads_sum.as_mut() {
+                grads_accum.accum(&new_grads);
+            } else {
+                grads_sum = Some(new_grads);
+            }
+
+            if i % cli.batch_size == 0 {
+                let mut val_losses = Vec::with_capacity(batch_size);
+                for val_sample in validation_samples.iter() {
+                    let (val_x, _last) = val_sample.split_at(sample_size - 1);
+
+                    let (_first, val_y_gt) = val_sample.split_at(1);
+
+                    let mut val_train_data = TransformerTrainData::default();
+
+                    model.naive_fwd(val_x, Some(&mut val_train_data))?;
+
+                    let val_grads = model.naive_bwd(&val_train_data, val_y_gt)?;
+
+                    val_losses.push(val_grads.loss);
+                }
+
+                let avg_val_loss =
+                    val_losses.iter().fold(0.0, |acc, x| acc + x) / val_losses.len() as f32;
+
+                let avg_t_loss = losses.iter().fold(0.0, |acc, x| acc + x) / losses.len() as f32;
+                let min_t_loss = losses
                     .iter()
                     .fold(std::f32::MAX, |acc, x| if *x < acc { *x } else { acc });
-                let max = losses
+                let max_t_loss = losses
                     .iter()
                     .fold(std::f32::MIN, |acc, x| if *x > acc { *x } else { acc });
 
                 info!(
-                    "txt No.: {:10} | Sample No.: {:6} | avg: {:11.9} | min: {:11.9} | max: {:11.9}",
-                    txt_idx, i, avg, min, max
+                    "txt No.: {:10} | Sample No.: {:6} | V loss: {:11.9} | avg T loss: {:11.9} | min: {:11.9} | max: {:11.9}",
+                    txt_idx, i, avg_val_loss, avg_t_loss, min_t_loss, max_t_loss
                 );
 
+                // Apply gradients
+                if let Some(grads_sum) = grads_sum.as_mut() {
+                    grads_sum.to_mean(batch_size);
+                    model.apply_grads(&grads_sum, cli.lr * batch_size as f32)?;
+                } else {
+                    warn!("grads_accum still empty after batch evaluated");
+                }
+
                 losses = vec![];
+                grads_sum = None;
             }
 
             tokens_sampled += sample_len;
