@@ -8,7 +8,8 @@ use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use rand::Rng;
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 use std::cmp::PartialOrd;
@@ -55,6 +56,15 @@ macro_rules! check_floats_not_inf {
     };
 }
 
+#[cfg(not(feature = "check_floats"))]
+fn do_check_floats_normal<D: Dimension>(
+    _a: &Array<f32, D>,
+    _name: &str,
+    _skip_nan: bool,
+    _skip_inf: bool,
+) -> Result<(), ErrBox> { Ok(())}
+
+#[cfg(feature = "check_floats")]
 fn do_check_floats_normal<D: Dimension>(
     a: &Array<f32, D>,
     name: &str,
@@ -185,13 +195,38 @@ impl TransformerGradients {
             .zip(other.grad_blocks.par_iter())
             .for_each(|(block_grads, other_block_grads)| block_grads.accum(other_block_grads));
     }
-    pub fn to_mean(&mut self, n: usize) {
-        self.grad_l_embed /= n as f32;
-        self.grad_l_unembed /= n as f32;
 
-        self.grad_blocks
-            .par_iter_mut()
-            .for_each(|block_grads| block_grads.to_mean(n));
+    /// Sums the squares of all model gradients
+    pub fn sum_squares(&self) -> f32 {
+        let embed_unembed_iter = vec![&self.grad_l_embed, &self.grad_l_unembed]
+            .into_par_iter()
+            .map(|array| array.pow2().sum());
+
+        let tb_iter = self.grad_blocks.par_iter().map(|tb| tb.sum_squares());
+
+        let sum = embed_unembed_iter.chain(tb_iter).sum();
+
+        return sum;
+    }
+
+    pub fn l2_norm_clip(&mut self, max_norm: f32) {
+        let l2_norm = self.sum_squares().sqrt();
+
+        let coeff = max_norm / clip_if_needed(l2_norm);
+
+        if coeff < 1.0 {
+            self.multiply(coeff);
+        }
+    }
+
+    /// Multiply all parameters by coeff
+    pub fn multiply(&mut self, coeff: f32) {
+        self.grad_l_embed *= coeff;
+        self.grad_l_unembed *= coeff;
+
+        self.grad_blocks.par_iter_mut().for_each(|grad_block| {
+            grad_block.multiply(coeff);
+        });
     }
 }
 
@@ -203,7 +238,7 @@ impl Transformer {
         num_layers: usize,
         num_heads: usize,
         ff_dim: usize,
-	rng: &mut R
+        rng: &mut R,
     ) -> Result<Self, ErrBox> {
         if embed_dim % num_heads != 0 {
             return Err(format!(
@@ -486,26 +521,69 @@ impl TBGradients {
         self.grad_l_ff2_b += &other.grad_l_ff2_b;
     }
 
-    pub fn to_mean(&mut self, n: usize) {
-        self.grad_l_ln_scale /= n as f32;
-        self.grad_l_ln_bias /= n as f32;
+    pub fn sum_squares(&self) -> f32 {
+        let array1_iter = vec![&self.grad_l_ln_scale, &self.grad_l_ln_bias]
+            .into_par_iter()
+            .map(|arr| arr.pow2().sum());
 
-        self.grad_l_query /= n as f32;
-        self.grad_l_key /= n as f32;
-        self.grad_l_value /= n as f32;
+        let array2_iter = vec![
+            &self.grad_l_atn_out,
+            &self.grad_l_ff1,
+            &self.grad_l_ff1_b,
+            &self.grad_l_ff2,
+            &self.grad_l_ff2_b,
+        ]
+        .into_par_iter()
+        .map(|arr| arr.pow2().sum());
 
-        self.grad_l_atn_out /= n as f32;
+        let array3_iter = vec![&self.grad_l_query, &self.grad_l_key, &self.grad_l_value]
+            .into_par_iter()
+            .map(|arr| arr.pow2().sum());
 
-        self.grad_l_ff1 /= n as f32;
-        self.grad_l_ff1_b /= n as f32;
+        // Rust is not very happy about Array1, Array2, ...,
+        // technically being distinct types, so we apply a map to the
+        // square sum independently for all three, ending up with a
+        // plain f32 partial sums iterator.
+        let sum = array1_iter.chain(array2_iter).chain(array3_iter).sum();
 
-        self.grad_l_ff2 /= n as f32;
-        self.grad_l_ff2_b /= n as f32;
+        return sum;
+    }
+
+    pub fn multiply(&mut self, coeff: f32) {
+        // Array1
+        vec![&mut self.grad_l_ln_scale, &mut self.grad_l_ln_bias]
+            .into_par_iter()
+            .for_each(|arr| *arr *= coeff);
+
+        // Array2
+        vec![
+            &mut self.grad_l_atn_out,
+            &mut self.grad_l_ff1,
+            &mut self.grad_l_ff1_b,
+            &mut self.grad_l_ff2,
+            &mut self.grad_l_ff2_b,
+        ]
+        .into_par_iter()
+        .for_each(|arr| *arr *= coeff);
+
+        // Array3
+        vec![
+            &mut self.grad_l_query,
+            &mut self.grad_l_key,
+            &mut self.grad_l_value,
+        ]
+        .into_par_iter()
+        .for_each(|arr| *arr *= coeff);
     }
 }
 
 impl TransformerBlock {
-    pub fn new<R: Rng + ?Sized>(embed_dim: usize, num_heads: usize, ff_dim: usize, rng: &mut R) -> Self {
+    pub fn new<R: Rng + ?Sized>(
+        embed_dim: usize,
+        num_heads: usize,
+        ff_dim: usize,
+        rng: &mut R,
+    ) -> Self {
         let head_size = embed_dim / num_heads;
 
         let qkv_rand_dist = dims2rand_dist(vec![num_heads, head_size, embed_dim].as_slice());
@@ -531,7 +609,11 @@ impl TransformerBlock {
         let ff1_b = Array2::random_using((1, ff_dim), dims2rand_dist(vec![ff_dim].as_slice()), rng);
 
         let ff2 = Array2::random_using((ff_dim, embed_dim), ff_rand_dist, rng);
-        let ff2_b = Array2::random_using((1, embed_dim), dims2rand_dist(vec![embed_dim].as_slice()), rng);
+        let ff2_b = Array2::random_using(
+            (1, embed_dim),
+            dims2rand_dist(vec![embed_dim].as_slice()),
+            rng,
+        );
 
         Self {
             num_heads,

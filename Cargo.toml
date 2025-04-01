@@ -32,3 +32,6 @@ path = "src/train_llm.rs"
 
 [profile.release]
 debug = true # for flamegraph
+
+[features]
+check_floats = []

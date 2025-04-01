@@ -61,6 +61,10 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 0xdeadbeef)]
     rng_seed: u64,
 
+    /// Max L2 norm for gradients. If norm exceeds this value 
+    #[arg(short, long, default_value_t = 1.0)]
+    max_norm: f32,
+
     /// Path to fineweb parquet file
     #[arg(
         short = 'd',
@@ -228,7 +232,8 @@ fn main() -> Result<(), ErrBox> {
 
                 // Apply gradients
                 if let Some(grads_sum) = grads_sum.as_mut() {
-                    grads_sum.to_mean(batch_size);
+                    grads_sum.multiply(1.0 / batch_size as f32);
+		    grads_sum.l2_norm_clip(cli.max_norm);
                     model.apply_grads(&grads_sum, cli.lr * batch_size as f32)?;
                 } else {
                     warn!("grads_accum still empty after batch evaluated");
